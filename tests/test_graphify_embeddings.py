@@ -1,23 +1,41 @@
 from __future__ import annotations
 
+import argparse
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
+from graphify_embeddings import cli
 from graphify_embeddings.graph import GraphifyGraph
 from graphify_embeddings.index import EmbeddingIndex
-from graphify_embeddings.models import QwenReranker
+from graphify_embeddings.models import QwenEmbedder, QwenReranker
 
 
 class FakeEmbedder:
     model_name = "fake/qwen-8b"
     device = "cuda:0"
+    backend = "fake"
+    revision = "test-revision"
+    wrapper_sha256 = None
+    requested_dtype = "fp32"
 
-    def __init__(self):
+    def __init__(self, instruction="test instruction"):
+        self.instruction = instruction
         self.calls: list[list[str]] = []
+
+    def cache_identity(self):
+        return {
+            "model": self.model_name,
+            "backend": self.backend,
+            "instruction": self.instruction,
+            "revision": self.revision,
+            "wrapper_sha256": self.wrapper_sha256,
+            "dtype": self.requested_dtype,
+        }
 
     def encode(self, texts, *, show_progress=False):
         self.calls.append(list(texts))
@@ -36,6 +54,15 @@ class FakeEmbedder:
             vector /= np.linalg.norm(vector)
             vectors.append(vector)
         return np.stack(vectors) if vectors else np.empty((0, 4), dtype=np.float32)
+
+
+class ClosingEmbedder(FakeEmbedder):
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
 
 class FakeReranker:
@@ -171,6 +198,113 @@ class GraphifyEmbeddingTests(unittest.TestCase):
         self.assertEqual(results[0]["id"], "reranker")
         self.assertIn("reranker_score", results[0])
 
+    def test_instruction_change_invalidates_all_cached_vectors(self):
+        graph = GraphifyGraph(self.graph_path)
+        index = EmbeddingIndex(graph)
+        index.build(FakeEmbedder("instruction one"), show_progress=False)
+        replacement = FakeEmbedder("instruction two")
+        stats = index.build(replacement, show_progress=False)
+        self.assertEqual(stats["embedded"], 3)
+        self.assertEqual(stats["reused"], 0)
+
+    def test_cache_generation_and_finite_vector_validation(self):
+        graph = GraphifyGraph(self.graph_path)
+        index = EmbeddingIndex(graph)
+        index.build(FakeEmbedder(), show_progress=False)
+        metadata = json.loads(index.metadata_path.read_text(encoding="utf-8"))
+        metadata["generation_id"] = "wrong-generation"
+        index.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "different generations"):
+            EmbeddingIndex(graph).load()
+
+        index.build(FakeEmbedder(), force=True, show_progress=False)
+        with np.load(index.vectors_path, allow_pickle=False) as data:
+            node_ids = data["node_ids"].copy()
+            vectors = data["vectors"].copy()
+            generation_id = data["generation_id"].copy()
+        vectors[0, 0] = np.nan
+        np.savez_compressed(
+            index.vectors_path,
+            node_ids=node_ids,
+            vectors=vectors,
+            generation_id=generation_id,
+        )
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            EmbeddingIndex(graph).load()
+
+    def test_invalid_search_and_link_parameters_are_rejected(self):
+        graph = GraphifyGraph(self.graph_path)
+        index = EmbeddingIndex(graph)
+        embedder = FakeEmbedder()
+        index.build(embedder, show_progress=False)
+        query = embedder.encode(["embedding cache"])[0]
+        with self.assertRaisesRegex(ValueError, "top_k"):
+            index.search("query", query, top_k=0)
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            index.search("query", np.asarray([np.nan, 0, 0, 0], dtype=np.float32))
+        with self.assertRaisesRegex(ValueError, "threshold"):
+            index.similarity_pairs(threshold=float("nan"))
+
+    def test_output_cannot_bypass_in_place_backup(self):
+        graph = GraphifyGraph(self.graph_path)
+        index = EmbeddingIndex(graph)
+        index.build(FakeEmbedder(), show_progress=False)
+        original = self.graph_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "cannot overwrite"):
+            index.write_linked_graph([], output=self.graph_path)
+        self.assertEqual(self.graph_path.read_bytes(), original)
+        self.assertFalse(self.graph_path.with_suffix(".json.bak").exists())
+
+    def test_directed_graph_gets_symmetric_semantic_edges(self):
+        payload = json.loads(self.graph_path.read_text(encoding="utf-8"))
+        payload["directed"] = True
+        self.graph_path.write_text(json.dumps(payload), encoding="utf-8")
+        graph = GraphifyGraph(self.graph_path)
+        links = graph.semantic_links(
+            [("cache-loader", "gpu-loader", 0.9)], model="fake"
+        )
+        self.assertEqual(len(links), 2)
+        self.assertEqual(
+            {(link["source"], link["target"]) for link in links},
+            {("cache-loader", "gpu-loader"), ("gpu-loader", "cache-loader")},
+        )
+
+    def test_embedder_cleanup_when_incremental_build_fails(self):
+        graph = GraphifyGraph(self.graph_path)
+        embedder = ClosingEmbedder()
+        args = argparse.Namespace(
+            no_source_context=False,
+            force_index=True,
+            force=False,
+            embedding_model=embedder.model_name,
+            instruction=embedder.instruction,
+            dtype="fp32",
+        )
+        with (
+            patch("graphify_embeddings.cli._embedder_from_args", return_value=embedder),
+            patch.object(EmbeddingIndex, "build", side_effect=RuntimeError("boom")),
+            self.assertRaisesRegex(RuntimeError, "boom"),
+        ):
+            cli._ensure_index(graph, args, keep_embedder=True)
+        self.assertTrue(embedder.closed)
+
+    def test_official_vl_wrappers_reject_cpu_instead_of_ignoring_device(self):
+        embedding_model = self.root / "embedding-model" / "scripts"
+        embedding_model.mkdir(parents=True)
+        (embedding_model / "qwen3_vl_embedding.py").write_text(
+            "# fixture", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
+            QwenEmbedder(str(embedding_model.parent), device="cpu")
+
+        reranker_model = self.root / "reranker-model" / "scripts"
+        reranker_model.mkdir(parents=True)
+        (reranker_model / "qwen3_vl_reranker.py").write_text(
+            "# fixture", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
+            QwenReranker(str(reranker_model.parent), device="cpu")
+
     def test_reranker_template_compatibility_view_does_not_mutate_snapshot(self):
         model = self.root / "model"
         (model / "additional_chat_templates").mkdir(parents=True)
@@ -201,7 +335,9 @@ class GraphifyEmbeddingTests(unittest.TestCase):
         enriched = json.loads(target.read_text(encoding="utf-8"))
         self.assertEqual(len(original["links"]), 1)
         semantic = [
-            link for link in enriched["links"] if link.get("relation") == "semantically_similar_to"
+            link
+            for link in enriched["links"]
+            if link.get("relation") == "semantically_similar_to"
         ]
         self.assertEqual(len(semantic), count)
         self.assertEqual(semantic[0]["confidence"], "INFERRED")

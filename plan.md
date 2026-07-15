@@ -38,13 +38,14 @@ graphify-embeddings index
 
 ```text
 graphify-out/cache/embeddings.json
-  schema version, model, dimension, node/content hashes, source-context mode
+  schema version, generation ID, immutable model revision, verified wrapper SHA-256,
+  backend/instruction/dtype identity, dimension, node/content hashes, source-context mode
 
 graphify-out/cache/embeddings.npz
-  node IDs + normalized float32 matrix
+  matching generation ID + node IDs + normalized float32 matrix
 ```
 
-Unchanged vectors are reused. Changed/new node texts are embedded again. Removed nodes disappear from the rewritten matrix.
+Unchanged vectors are reused only when the complete embedding identity and content hashes match. Changed/new node texts are embedded again. Removed nodes disappear from the rewritten matrix. Mixed-generation, non-finite, duplicate-ID, row-count, and dimension mismatches are rejected.
 
 ## GPU lifecycle
 

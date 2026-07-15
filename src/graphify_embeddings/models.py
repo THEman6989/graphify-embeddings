@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import importlib.util
 import os
 import tempfile
@@ -12,8 +13,14 @@ import numpy as np
 
 DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-VL-Embedding-8B"
 DEFAULT_EMBEDDING_REVISION = "2c4565515e0f265c6511776e7193b22c0968ddc7"
+DEFAULT_EMBEDDING_WRAPPER_SHA256 = (
+    "8ffa74a1a6bb759610c57865ea416fd4daf9936cb787520e1112a3e1d547f36a"
+)
 DEFAULT_RERANKER_MODEL = "Qwen/Qwen3-VL-Reranker-8B"
 DEFAULT_RERANKER_REVISION = "b212dc8c91a8164aef1ea2de9c1a867611e75c04"
+DEFAULT_RERANKER_WRAPPER_SHA256 = (
+    "bd5d2f5d97fc4a738864d93f6b15d8850243e60da4484f3ea78867a46efdebd6"
+)
 DEFAULT_INSTRUCTION = "Retrieve code graph nodes relevant to the user's query."
 
 
@@ -23,8 +30,7 @@ def _imports():
         from sentence_transformers import CrossEncoder, SentenceTransformer
     except ImportError as exc:
         raise RuntimeError(
-            "GPU dependencies are missing. Install with: "
-            "uv pip install -e '.[gpu]'"
+            "GPU dependencies are missing. Install with: uv pip install -e '.[gpu]'"
         ) from exc
     return torch, SentenceTransformer, CrossEncoder
 
@@ -85,24 +91,53 @@ class QwenEmbedder:
         self.torch = torch
         self.model_name = model_name
         self.device = resolve_device(device)
+        self.requested_dtype = str(dtype).lower()
         self.dtype = resolve_dtype(dtype, self.device)
         self.batch_size = max(1, int(batch_size))
         self.instruction = instruction
         self.backend = "sentence_transformers"
+        self.revision = (
+            DEFAULT_EMBEDDING_REVISION
+            if model_name == DEFAULT_EMBEDDING_MODEL
+            else None
+        )
+        self.wrapper_sha256 = None
 
         # Exact backend used by the Comfy custom node: the official model-snapshot
         # Qwen3VLEmbedder and its process([{"text": ...}]) API. No llama.cpp,
         # Ollama, or HTTP server is involved.
-        if model_name == DEFAULT_EMBEDDING_MODEL or Path(model_name).expanduser().is_dir():
+        if (
+            model_name == DEFAULT_EMBEDDING_MODEL
+            or Path(model_name).expanduser().is_dir()
+        ):
             model_path = self._resolve_model_path(model_name, local_files_only)
             script = model_path / "scripts" / "qwen3_vl_embedding.py"
             if script.is_file():
+                if self.device == "cpu":
+                    raise RuntimeError(
+                        "The official Qwen3-VL embedding wrapper used by the Comfy node "
+                        "requires CUDA; choose --device cuda:N"
+                    )
+                self.wrapper_sha256 = hashlib.sha256(script.read_bytes()).hexdigest()
+                if (
+                    model_name == DEFAULT_EMBEDDING_MODEL
+                    and self.wrapper_sha256 != DEFAULT_EMBEDDING_WRAPPER_SHA256
+                ):
+                    raise RuntimeError(
+                        "Pinned Qwen embedding wrapper failed SHA-256 verification"
+                    )
                 wrapper_class = self._load_wrapper(script)
-                self.model = wrapper_class(
-                    model_name_or_path=str(model_path),
-                    torch_dtype=self.dtype,
-                    local_files_only=True,
-                )
+                try:
+                    self.model = wrapper_class(
+                        model_name_or_path=str(model_path),
+                        torch_dtype=self.dtype,
+                        local_files_only=True,
+                    )
+                except Exception:
+                    gc.collect()
+                    if self.torch.cuda.is_available():
+                        self.torch.cuda.empty_cache()
+                    raise
                 self.backend = "official_vl_wrapper"
                 return
 
@@ -128,7 +163,9 @@ class QwenEmbedder:
         try:
             from huggingface_hub import snapshot_download
         except ImportError as exc:
-            raise RuntimeError("huggingface-hub is required for Qwen VL embedding") from exc
+            raise RuntimeError(
+                "huggingface-hub is required for Qwen VL embedding"
+            ) from exc
         return Path(
             snapshot_download(
                 repo_id=model_name,
@@ -150,7 +187,19 @@ class QwenEmbedder:
             raise RuntimeError(f"Qwen3VLEmbedder class missing in {script}")
         return wrapper
 
-    def encode(self, texts: Sequence[str], *, show_progress: bool = False) -> np.ndarray:
+    def cache_identity(self) -> dict[str, str | None]:
+        return {
+            "model": self.model_name,
+            "backend": self.backend,
+            "instruction": self.instruction,
+            "revision": self.revision,
+            "wrapper_sha256": self.wrapper_sha256,
+            "dtype": self.requested_dtype,
+        }
+
+    def encode(
+        self, texts: Sequence[str], *, show_progress: bool = False
+    ) -> np.ndarray:
         if not texts:
             return np.empty((0, 0), dtype=np.float32)
         if self.backend == "official_vl_wrapper":
@@ -159,10 +208,7 @@ class QwenEmbedder:
             for start in range(0, len(text_list), self.batch_size):
                 chunk = text_list[start : start + self.batch_size]
                 embeddings = self.model.process(
-                    [
-                        {"text": text, "instruction": self.instruction}
-                        for text in chunk
-                    ],
+                    [{"text": text, "instruction": self.instruction} for text in chunk],
                     normalize=True,
                 )
                 if hasattr(embeddings, "detach"):
@@ -215,26 +261,56 @@ class QwenReranker:
         self.torch = torch
         self.model_name = model_name
         self.device = resolve_device(device)
+        self.requested_dtype = str(dtype).lower()
         self.dtype = resolve_dtype(dtype, self.device)
         self.instruction = instruction
         self.backend = "cross_encoder"
+        self.revision = (
+            DEFAULT_RERANKER_REVISION if model_name == DEFAULT_RERANKER_MODEL else None
+        )
 
         # sentence-transformers 5.5 cannot reconstruct Qwen's saved LogitScore
         # module from the 5.4 model artifact (missing true_token_id). The official
         # model snapshot ships a stable process() wrapper, which is also the path
         # used by the working ComfyUI implementation.
-        if model_name == DEFAULT_RERANKER_MODEL or Path(model_name).expanduser().is_dir():
+        if (
+            model_name == DEFAULT_RERANKER_MODEL
+            or Path(model_name).expanduser().is_dir()
+        ):
             model_path = self._resolve_model_path(model_name, local_files_only)
             script = model_path / "scripts" / "qwen3_vl_reranker.py"
             if script.is_file():
+                if self.device == "cpu":
+                    raise RuntimeError(
+                        "The official Qwen3-VL reranker wrapper used by the Comfy node "
+                        "requires CUDA; choose --device cuda:N"
+                    )
+                wrapper_sha256 = hashlib.sha256(script.read_bytes()).hexdigest()
+                if (
+                    model_name == DEFAULT_RERANKER_MODEL
+                    and wrapper_sha256 != DEFAULT_RERANKER_WRAPPER_SHA256
+                ):
+                    raise RuntimeError(
+                        "Pinned Qwen reranker wrapper failed SHA-256 verification"
+                    )
                 wrapper_class = self._load_wrapper(script)
                 load_path = self._processor_compatible_view(model_path)
-                self.model = wrapper_class(
-                    model_name_or_path=str(load_path),
-                    max_length=max_length,
-                    torch_dtype=self.dtype,
-                    local_files_only=True,
-                )
+                try:
+                    self.model = wrapper_class(
+                        model_name_or_path=str(load_path),
+                        max_length=max_length,
+                        torch_dtype=self.dtype,
+                        local_files_only=True,
+                    )
+                except Exception:
+                    model_view = getattr(self, "_model_view", None)
+                    self._model_view = None
+                    if model_view is not None:
+                        model_view.cleanup()
+                    gc.collect()
+                    if self.torch.cuda.is_available():
+                        self.torch.cuda.empty_cache()
+                    raise
                 self.backend = "official_vl_wrapper"
                 return
 
@@ -259,7 +335,9 @@ class QwenReranker:
         try:
             from huggingface_hub import snapshot_download
         except ImportError as exc:
-            raise RuntimeError("huggingface-hub is required for Qwen VL reranking") from exc
+            raise RuntimeError(
+                "huggingface-hub is required for Qwen VL reranking"
+            ) from exc
         return Path(
             snapshot_download(
                 repo_id=model_name,
@@ -302,7 +380,9 @@ class QwenReranker:
             raise RuntimeError(f"Qwen3VLReranker class missing in {script}")
         return wrapper
 
-    def score(self, query: str, documents: Sequence[str], batch_size: int = 1) -> np.ndarray:
+    def score(
+        self, query: str, documents: Sequence[str], batch_size: int = 1
+    ) -> np.ndarray:
         if not documents:
             return np.empty((0,), dtype=np.float32)
         if self.backend == "official_vl_wrapper":

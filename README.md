@@ -17,7 +17,7 @@ Everything runs locally and directly through the model's Python wrapper. No API 
 
 `--device auto` deliberately chooses the first NVIDIA GPU (`cuda:0`). On Amin's machine that is the RTX 5090. The embedding model is unloaded before the optional 8B reranker is loaded, so both models do not occupy VRAM at the same time.
 
-CPU is supported via `--device cpu`, but an 8B model will be slow.
+The Comfy-compatible official VL wrappers require CUDA; `--device cpu` is rejected instead of silently using a GPU. CPU mode remains available only for explicitly selected alternative SentenceTransformers-compatible models.
 
 ## Install
 
@@ -110,11 +110,11 @@ Edges use Graphify's real `links` schema:
 Beside the graph:
 
 ```text
-graphify-out/cache/embeddings.json   metadata, model and content hashes
-graphify-out/cache/embeddings.npz    normalized float32 vectors + node IDs
+graphify-out/cache/embeddings.json   model/revision/wrapper/prompt identity, dimensions, content hashes, generation ID
+graphify-out/cache/embeddings.npz    normalized float32 vectors, node IDs, matching generation ID
 ```
 
-Only new or changed node texts are embedded on the next `index` run. Source context around `source_location` is included when the referenced source file exists.
+Only new or changed node texts are embedded on the next `index` run. Changing the instruction, dtype, backend, pinned model revision, or local wrapper script invalidates the relevant cache identity. A generation ID detects partial/crash-mixed metadata/vector writes, and non-finite or dimension-mismatched caches are rejected. Source context around `source_location` is included when the referenced source file exists.
 
 ## Models
 

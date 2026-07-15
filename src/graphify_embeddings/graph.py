@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from collections import deque
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -82,6 +83,16 @@ class GraphifyGraph:
             ).strip()
         return str(value).strip()
 
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _read_source_lines(source_path: Path) -> tuple[str, ...]:
+        try:
+            return tuple(
+                source_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            )
+        except OSError:
+            return ()
+
     def source_context(self, node: dict[str, Any], radius: int = 12) -> str:
         source = str(node.get("source_file") or "").strip()
         location = str(node.get("source_location") or "")
@@ -95,9 +106,8 @@ class GraphifyGraph:
             return ""
         if not source_path.is_file():
             return ""
-        try:
-            lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+        lines = self._read_source_lines(source_path)
+        if not lines:
             return ""
         line_index = max(0, int(match.group(1)) - 1)
         start = max(0, line_index - radius)
@@ -151,7 +161,9 @@ class GraphifyGraph:
     def degree(self, node_id: str) -> int:
         return len(self._adjacency.get(node_id, ()))
 
-    def neighbors(self, node_id: str, depth: int = 1, limit: int = 30) -> list[dict[str, Any]]:
+    def neighbors(
+        self, node_id: str, depth: int = 1, limit: int = 30
+    ) -> list[dict[str, Any]]:
         if depth <= 0 or node_id not in self.by_id:
             return []
         seen = {node_id}
@@ -198,17 +210,18 @@ class GraphifyGraph:
     ) -> list[dict[str, Any]]:
         links = []
         for source, target, score in pairs:
-            links.append(
-                {
-                    "source": source,
-                    "target": target,
-                    "relation": "semantically_similar_to",
-                    "type": "semantically_similar_to",
-                    "context": "qwen_embedding_cosine",
-                    "confidence": "INFERRED",
-                    "confidence_score": round(float(score), 6),
-                    "weight": round(float(score), 6),
-                    "embedding_model": model,
-                }
-            )
+            link = {
+                "source": source,
+                "target": target,
+                "relation": "semantically_similar_to",
+                "type": "semantically_similar_to",
+                "context": "qwen_embedding_cosine",
+                "confidence": "INFERRED",
+                "confidence_score": round(float(score), 6),
+                "weight": round(float(score), 6),
+                "embedding_model": model,
+            }
+            links.append(link)
+            if self.directed:
+                links.append({**link, "source": target, "target": source})
         return links

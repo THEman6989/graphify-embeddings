@@ -1,31 +1,39 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, Sequence
+from uuid import uuid4
 
 import numpy as np
 
 from .graph import GraphifyGraph
 
 
-CACHE_SCHEMA = 2
+CACHE_SCHEMA = 3
 
 
 class Embedder(Protocol):
     model_name: str
 
-    def encode(self, texts: Sequence[str], *, show_progress: bool = False) -> np.ndarray: ...
+    def cache_identity(self) -> dict[str, Any]: ...
+
+    def encode(
+        self, texts: Sequence[str], *, show_progress: bool = False
+    ) -> np.ndarray: ...
 
 
 class Reranker(Protocol):
     model_name: str
 
-    def score(self, query: str, documents: Sequence[str], batch_size: int = 1) -> np.ndarray: ...
+    def score(
+        self, query: str, documents: Sequence[str], batch_size: int = 1
+    ) -> np.ndarray: ...
 
 
 class EmbeddingIndex:
@@ -52,8 +60,22 @@ class EmbeddingIndex:
         with np.load(self.vectors_path, allow_pickle=False) as data:
             self.node_ids = [str(value) for value in data["node_ids"].tolist()]
             self.vectors = np.asarray(data["vectors"], dtype=np.float32)
+            vector_generation = str(data["generation_id"].item())
+        expected_rows = int(self.metadata.get("node_count", -1))
+        expected_dimension = int(self.metadata.get("dimension", -1))
         if self.vectors.ndim != 2 or self.vectors.shape[0] != len(self.node_ids):
             raise ValueError("Embedding cache is inconsistent")
+        if len(set(self.node_ids)) != len(self.node_ids):
+            raise ValueError("Embedding cache contains duplicate node IDs")
+        if (
+            expected_rows != len(self.node_ids)
+            or expected_dimension != self.vectors.shape[1]
+        ):
+            raise ValueError("Embedding cache metadata dimensions do not match vectors")
+        if vector_generation != str(self.metadata.get("generation_id")):
+            raise ValueError("Embedding cache files belong to different generations")
+        if not np.isfinite(self.vectors).all():
+            raise ValueError("Embedding cache contains non-finite vectors")
         return self
 
     @staticmethod
@@ -70,15 +92,20 @@ class EmbeddingIndex:
             raise
 
     @staticmethod
-    def _write_vectors_atomic(path: Path, node_ids: list[str], vectors: np.ndarray) -> None:
+    def _write_vectors_atomic(
+        path: Path, node_ids: list[str], vectors: np.ndarray, generation_id: str
+    ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".npz", dir=path.parent)
+        fd, temporary = tempfile.mkstemp(
+            prefix=path.name + ".", suffix=".npz", dir=path.parent
+        )
         os.close(fd)
         try:
             np.savez_compressed(
                 temporary,
                 node_ids=np.asarray(node_ids, dtype=np.str_),
                 vectors=np.asarray(vectors, dtype=np.float32),
+                generation_id=np.asarray(generation_id, dtype=np.str_),
             )
             os.replace(temporary, path)
         except Exception:
@@ -97,6 +124,18 @@ class EmbeddingIndex:
         node_ids = [node_id for node_id, _ in documents]
         text_by_id = dict(documents)
         hashes = self.graph.content_hashes(include_source=include_source)
+        identity_factory = getattr(embedder, "cache_identity", None)
+        if callable(identity_factory):
+            embedding_identity = dict(identity_factory())
+        else:
+            embedding_identity = {
+                "model": embedder.model_name,
+                "backend": getattr(embedder, "backend", None),
+                "instruction": getattr(embedder, "instruction", None),
+                "revision": getattr(embedder, "revision", None),
+                "wrapper_sha256": getattr(embedder, "wrapper_sha256", None),
+                "dtype": str(getattr(embedder, "dtype", "unknown")),
+            }
 
         old_vectors: dict[str, np.ndarray] = {}
         old_hashes: dict[str, str] = {}
@@ -104,12 +143,14 @@ class EmbeddingIndex:
             try:
                 self.load()
                 if (
-                    self.metadata.get("model") == embedder.model_name
+                    self.metadata.get("embedding_identity") == embedding_identity
                     and self.metadata.get("include_source") == include_source
                 ):
                     old_hashes = {
                         str(key): str(value)
-                        for key, value in self.metadata.get("content_hashes", {}).items()
+                        for key, value in self.metadata.get(
+                            "content_hashes", {}
+                        ).items()
                     }
                     old_vectors = {
                         node_id: self.vectors[index]
@@ -128,8 +169,12 @@ class EmbeddingIndex:
             [text_by_id[node_id] for node_id in changed],
             show_progress=show_progress,
         )
-        if changed and new_vectors.shape[0] != len(changed):
-            raise RuntimeError("Embedding backend returned the wrong number of vectors")
+        if changed and (new_vectors.ndim != 2 or new_vectors.shape[0] != len(changed)):
+            raise RuntimeError(
+                "Embedding backend returned the wrong number or shape of vectors"
+            )
+        if changed and not np.isfinite(new_vectors).all():
+            raise RuntimeError("Embedding backend returned non-finite vectors")
 
         combined = dict(old_vectors)
         for index, node_id in enumerate(changed):
@@ -138,15 +183,26 @@ class EmbeddingIndex:
             missing = [node_id for node_id in node_ids if node_id not in combined]
             if missing:
                 raise RuntimeError(f"No vectors produced for {len(missing)} node(s)")
-            vectors = np.stack([combined[node_id] for node_id in node_ids]).astype(np.float32)
+            vectors = np.stack([combined[node_id] for node_id in node_ids]).astype(
+                np.float32
+            )
         else:
             vectors = np.empty((0, 0), dtype=np.float32)
 
+        if not np.isfinite(vectors).all():
+            raise RuntimeError("Combined embedding index contains non-finite vectors")
+        generation_id = uuid4().hex
         metadata = {
             "schema_version": CACHE_SCHEMA,
+            "generation_id": generation_id,
             "model": embedder.model_name,
             "backend": getattr(embedder, "backend", None),
-            "dimension": int(vectors.shape[1]) if vectors.ndim == 2 and vectors.size else 0,
+            "instruction": getattr(embedder, "instruction", None),
+            "requested_dtype": getattr(embedder, "requested_dtype", None),
+            "embedding_identity": embedding_identity,
+            "dimension": int(vectors.shape[1])
+            if vectors.ndim == 2 and vectors.size
+            else 0,
             "node_count": len(node_ids),
             "include_source": include_source,
             "graph": str(self.graph.path),
@@ -154,7 +210,7 @@ class EmbeddingIndex:
             "content_hashes": hashes,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._write_vectors_atomic(self.vectors_path, node_ids, vectors)
+        self._write_vectors_atomic(self.vectors_path, node_ids, vectors, generation_id)
         self._write_json_atomic(self.metadata_path, metadata)
         self.metadata = metadata
         self.node_ids = node_ids
@@ -184,9 +240,22 @@ class EmbeddingIndex:
         reranker: Reranker | None = None,
         rerank_batch_size: int = 1,
     ) -> list[dict[str, Any]]:
+        if int(top_k) < 1 or int(candidate_k) < 1:
+            raise ValueError("top_k and candidate_k must be positive")
+        if int(neighbors) < 0 or int(rerank_batch_size) < 1:
+            raise ValueError(
+                "neighbors must be non-negative and rerank_batch_size positive"
+            )
+        if not all(
+            math.isfinite(float(weight))
+            for weight in (semantic_weight, lexical_weight, structure_weight)
+        ):
+            raise ValueError("Search weights must be finite")
         if not self.node_ids:
             self.load()
         vector = np.asarray(query_vector, dtype=np.float32).reshape(-1)
+        if not np.isfinite(vector).all():
+            raise ValueError("Query embedding contains non-finite values")
         if self.vectors.shape[1] != vector.shape[0]:
             raise ValueError(
                 f"Query dimension {vector.shape[0]} != index dimension {self.vectors.shape[1]}"
@@ -195,7 +264,9 @@ class EmbeddingIndex:
         if norm <= 0:
             raise ValueError("Query embedding has zero norm")
         semantic_scores = self.vectors @ (vector / norm)
-        max_degree = max((self.graph.degree(node_id) for node_id in self.node_ids), default=1)
+        max_degree = max(
+            (self.graph.degree(node_id) for node_id in self.node_ids), default=1
+        )
 
         ranked: list[dict[str, Any]] = []
         text_cache: dict[str, str] = {}
@@ -236,6 +307,8 @@ class EmbeddingIndex:
             )
             if len(rerank_scores) != len(pool):
                 raise RuntimeError("Reranker returned the wrong number of scores")
+            if not np.isfinite(rerank_scores).all():
+                raise RuntimeError("Reranker returned non-finite scores")
             for item, rerank_score in zip(pool, rerank_scores, strict=True):
                 item["reranker_score"] = round(float(rerank_score), 6)
                 item["score"] = round(
@@ -247,7 +320,7 @@ class EmbeddingIndex:
             for item in pool:
                 item["score"] = item["retrieval_score"]
 
-        results = pool[: max(1, int(top_k))]
+        results = pool[: int(top_k)]
         if neighbors > 0:
             for item in results:
                 item["neighbors"] = self.graph.neighbors(item["id"], depth=neighbors)
@@ -263,20 +336,28 @@ class EmbeddingIndex:
         if not self.node_ids:
             self.load()
         count = len(self.node_ids)
+        threshold = float(threshold)
+        if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be finite and within [-1, 1]")
+        if int(max_neighbors) < 1 or int(block_size) < 1:
+            raise ValueError("max_neighbors and block_size must be positive")
         if count < 2:
             return []
-        max_neighbors = max(1, int(max_neighbors))
-        threshold = float(threshold)
+        max_neighbors = int(max_neighbors)
         pairs: dict[tuple[str, str], float] = {}
-        for start in range(0, count, max(1, int(block_size))):
-            stop = min(count, start + max(1, int(block_size)))
+        for start in range(0, count, int(block_size)):
+            stop = min(count, start + int(block_size))
             scores = self.vectors[start:stop] @ self.vectors.T
             for local_index, row in enumerate(scores):
                 source_index = start + local_index
                 row[source_index] = -np.inf
                 candidate_count = min(max_neighbors, count - 1)
-                candidate_indices = np.argpartition(row, -candidate_count)[-candidate_count:]
-                candidate_indices = candidate_indices[np.argsort(row[candidate_indices])[::-1]]
+                candidate_indices = np.argpartition(row, -candidate_count)[
+                    -candidate_count:
+                ]
+                candidate_indices = candidate_indices[
+                    np.argsort(row[candidate_indices])[::-1]
+                ]
                 for target_index in candidate_indices:
                     score = float(row[target_index])
                     if score < threshold:
@@ -319,6 +400,10 @@ class EmbeddingIndex:
             shutil.copy2(target, backup)
         elif output is not None:
             target = Path(output).expanduser().resolve()
+            if target == self.graph.path:
+                raise ValueError(
+                    "--output cannot overwrite the input graph; use --in-place to create a backup"
+                )
         else:
             target = self.graph.path.with_name(self.graph.path.stem + ".semantic.json")
         self._write_json_atomic(target, payload)
