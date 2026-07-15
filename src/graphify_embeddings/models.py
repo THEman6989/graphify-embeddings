@@ -140,6 +140,10 @@ class QwenEmbedder:
                     raise
                 self.backend = "official_vl_wrapper"
                 return
+            if model_name == DEFAULT_EMBEDDING_MODEL:
+                raise RuntimeError(
+                    f"Pinned Qwen embedding wrapper is missing: {script}"
+                )
 
         # Explicit alternative models such as Qwen3-Embedding-8B retain the
         # standard SentenceTransformers path.
@@ -313,6 +317,8 @@ class QwenReranker:
                     raise
                 self.backend = "official_vl_wrapper"
                 return
+            if model_name == DEFAULT_RERANKER_MODEL:
+                raise RuntimeError(f"Pinned Qwen reranker wrapper is missing: {script}")
 
         self.model = CrossEncoder(
             model_name,

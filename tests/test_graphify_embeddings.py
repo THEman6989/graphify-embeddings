@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,7 +14,12 @@ import numpy as np
 from graphify_embeddings import cli
 from graphify_embeddings.graph import GraphifyGraph
 from graphify_embeddings.index import EmbeddingIndex
-from graphify_embeddings.models import QwenEmbedder, QwenReranker
+from graphify_embeddings.models import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_RERANKER_MODEL,
+    QwenEmbedder,
+    QwenReranker,
+)
 
 
 class FakeEmbedder:
@@ -54,6 +61,12 @@ class FakeEmbedder:
             vector /= np.linalg.norm(vector)
             vectors.append(vector)
         return np.stack(vectors) if vectors else np.empty((0, 4), dtype=np.float32)
+
+
+class SlowFakeEmbedder(FakeEmbedder):
+    def encode(self, texts, *, show_progress=False):
+        time.sleep(0.1)
+        return super().encode(texts, show_progress=show_progress)
 
 
 class ClosingEmbedder(FakeEmbedder):
@@ -207,6 +220,18 @@ class GraphifyEmbeddingTests(unittest.TestCase):
         self.assertEqual(stats["embedded"], 3)
         self.assertEqual(stats["reused"], 0)
 
+    def test_concurrent_builds_are_serialized_by_cache_lock(self):
+        graph = GraphifyGraph(self.graph_path)
+
+        def build_once():
+            return EmbeddingIndex(graph).build(SlowFakeEmbedder(), show_progress=False)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            stats = list(pool.map(lambda _: build_once(), range(2)))
+        self.assertEqual(sorted(item["embedded"] for item in stats), [0, 3])
+        loaded = EmbeddingIndex(graph).load()
+        self.assertEqual(len(loaded.node_ids), 3)
+
     def test_cache_generation_and_finite_vector_validation(self):
         graph = GraphifyGraph(self.graph_path)
         index = EmbeddingIndex(graph)
@@ -232,6 +257,27 @@ class GraphifyEmbeddingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-finite"):
             EmbeddingIndex(graph).load()
 
+        index.build(FakeEmbedder(), force=True, show_progress=False)
+        metadata = json.loads(index.metadata_path.read_text(encoding="utf-8"))
+        metadata.pop("content_hashes")
+        index.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "content hashes"):
+            EmbeddingIndex(graph).load()
+
+        index.build(FakeEmbedder(), force=True, show_progress=False)
+        with np.load(index.vectors_path, allow_pickle=False) as data:
+            node_ids = data["node_ids"].copy()
+            vectors = data["vectors"].copy() * 2.0
+            generation_id = data["generation_id"].copy()
+        np.savez_compressed(
+            index.vectors_path,
+            node_ids=node_ids,
+            vectors=vectors,
+            generation_id=generation_id,
+        )
+        with self.assertRaisesRegex(ValueError, "non-normalized"):
+            EmbeddingIndex(graph).load()
+
     def test_invalid_search_and_link_parameters_are_rejected(self):
         graph = GraphifyGraph(self.graph_path)
         index = EmbeddingIndex(graph)
@@ -244,6 +290,10 @@ class GraphifyEmbeddingTests(unittest.TestCase):
             index.search("query", np.asarray([np.nan, 0, 0, 0], dtype=np.float32))
         with self.assertRaisesRegex(ValueError, "threshold"):
             index.similarity_pairs(threshold=float("nan"))
+        strict_json = self.root / "strict.json"
+        with self.assertRaisesRegex(ValueError, "Out of range float values"):
+            EmbeddingIndex._write_json_atomic(strict_json, {"score": float("nan")})
+        self.assertFalse(strict_json.exists())
 
     def test_output_cannot_bypass_in_place_backup(self):
         graph = GraphifyGraph(self.graph_path)
@@ -304,6 +354,28 @@ class GraphifyEmbeddingTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
             QwenReranker(str(reranker_model.parent), device="cpu")
+
+    def test_default_vl_models_fail_closed_when_wrapper_is_missing(self):
+        empty_snapshot = self.root / "empty-snapshot"
+        empty_snapshot.mkdir()
+        with (
+            patch.object(
+                QwenEmbedder,
+                "_resolve_model_path",
+                return_value=empty_snapshot,
+            ),
+            self.assertRaisesRegex(RuntimeError, "embedding wrapper is missing"),
+        ):
+            QwenEmbedder(DEFAULT_EMBEDDING_MODEL, device="cuda:0")
+        with (
+            patch.object(
+                QwenReranker,
+                "_resolve_model_path",
+                return_value=empty_snapshot,
+            ),
+            self.assertRaisesRegex(RuntimeError, "reranker wrapper is missing"),
+        ):
+            QwenReranker(DEFAULT_RERANKER_MODEL, device="cuda:0")
 
     def test_reranker_template_compatibility_view_does_not_mutate_snapshot(self):
         model = self.root / "model"

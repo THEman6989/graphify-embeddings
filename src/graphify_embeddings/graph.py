@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+DOCUMENT_SCHEMA = 1
 _LINE_RE = re.compile(r"L(\d+)")
 _TOKEN_RE = re.compile(r"[A-Za-z_ÄÖÜäöüß][A-Za-z0-9_ÄÖÜäöüß.-]{1,}")
 

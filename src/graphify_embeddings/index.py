@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
 import shutil
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -12,10 +14,10 @@ from uuid import uuid4
 
 import numpy as np
 
-from .graph import GraphifyGraph
+from .graph import DOCUMENT_SCHEMA, GraphifyGraph
 
 
-CACHE_SCHEMA = 3
+CACHE_SCHEMA = 4
 
 
 class Embedder(Protocol):
@@ -67,6 +69,19 @@ class EmbeddingIndex:
             raise ValueError("Embedding cache is inconsistent")
         if len(set(self.node_ids)) != len(self.node_ids):
             raise ValueError("Embedding cache contains duplicate node IDs")
+        if set(self.node_ids) != set(self.graph.by_id):
+            raise ValueError("Embedding cache node IDs do not match the current graph")
+        content_hashes = self.metadata.get("content_hashes")
+        if not isinstance(content_hashes, dict) or set(content_hashes) != set(
+            self.node_ids
+        ):
+            raise ValueError("Embedding cache content hashes are incomplete")
+        identity = self.metadata.get("embedding_identity")
+        if (
+            not isinstance(identity, dict)
+            or identity.get("document_schema") != DOCUMENT_SCHEMA
+        ):
+            raise ValueError("Embedding cache text-construction schema is incompatible")
         if (
             expected_rows != len(self.node_ids)
             or expected_dimension != self.vectors.shape[1]
@@ -76,6 +91,10 @@ class EmbeddingIndex:
             raise ValueError("Embedding cache files belong to different generations")
         if not np.isfinite(self.vectors).all():
             raise ValueError("Embedding cache contains non-finite vectors")
+        if len(self.vectors):
+            norms = np.linalg.norm(self.vectors, axis=1)
+            if not np.allclose(norms, 1.0, rtol=1e-3, atol=1e-3):
+                raise ValueError("Embedding cache contains non-normalized vectors")
         return self
 
     @staticmethod
@@ -84,7 +103,9 @@ class EmbeddingIndex:
         fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, ensure_ascii=False)
+                json.dump(
+                    payload, handle, indent=2, ensure_ascii=False, allow_nan=False
+                )
                 handle.write("\n")
             os.replace(temporary, path)
         except Exception:
@@ -112,7 +133,34 @@ class EmbeddingIndex:
             Path(temporary).unlink(missing_ok=True)
             raise
 
+    @contextmanager
+    def _write_lock(self):
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self.cache_dir / ".embeddings.lock"
+        with lock_path.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def build(
+        self,
+        embedder: Embedder,
+        *,
+        include_source: bool = True,
+        force: bool = False,
+        show_progress: bool = True,
+    ) -> dict[str, Any]:
+        with self._write_lock():
+            return self._build_locked(
+                embedder,
+                include_source=include_source,
+                force=force,
+                show_progress=show_progress,
+            )
+
+    def _build_locked(
         self,
         embedder: Embedder,
         *,
@@ -136,6 +184,7 @@ class EmbeddingIndex:
                 "wrapper_sha256": getattr(embedder, "wrapper_sha256", None),
                 "dtype": str(getattr(embedder, "dtype", "unknown")),
             }
+        embedding_identity["document_schema"] = DOCUMENT_SCHEMA
 
         old_vectors: dict[str, np.ndarray] = {}
         old_hashes: dict[str, str] = {}
@@ -191,6 +240,10 @@ class EmbeddingIndex:
 
         if not np.isfinite(vectors).all():
             raise RuntimeError("Combined embedding index contains non-finite vectors")
+        if len(vectors):
+            norms = np.linalg.norm(vectors, axis=1)
+            if not np.allclose(norms, 1.0, rtol=1e-3, atol=1e-3):
+                raise RuntimeError("Embedding backend returned non-normalized vectors")
         generation_id = uuid4().hex
         metadata = {
             "schema_version": CACHE_SCHEMA,

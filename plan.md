@@ -45,7 +45,7 @@ graphify-out/cache/embeddings.npz
   matching generation ID + node IDs + normalized float32 matrix
 ```
 
-Unchanged vectors are reused only when the complete embedding identity and content hashes match. Changed/new node texts are embedded again. Removed nodes disappear from the rewritten matrix. Mixed-generation, non-finite, duplicate-ID, row-count, and dimension mismatches are rejected.
+Unchanged vectors are reused only when the complete embedding identity, document-construction schema, graph membership, and content hashes match. Changed/new node texts are embedded again. Removed nodes disappear from the rewritten matrix. A writer lock serializes concurrent builds. Mixed-generation, non-finite, non-normalized, duplicate-ID, graph-membership, content-hash, row-count, and dimension mismatches are rejected.
 
 ## GPU lifecycle
 

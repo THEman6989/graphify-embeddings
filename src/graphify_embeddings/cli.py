@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .graph import GraphifyGraph
+from .graph import DOCUMENT_SCHEMA, GraphifyGraph
 from .index import EmbeddingIndex
 from .models import (
     DEFAULT_EMBEDDING_MODEL,
@@ -64,6 +64,7 @@ def _expected_embedding_identity(args: argparse.Namespace) -> dict[str, str | No
         else None,
         "wrapper_sha256": wrapper_sha256,
         "dtype": str(args.dtype).lower(),
+        "document_schema": DOCUMENT_SCHEMA,
     }
 
 
@@ -212,7 +213,7 @@ def command_index(args: argparse.Namespace) -> int:
             include_source=not args.no_source_context,
             force=args.force,
         )
-    print(json.dumps(stats, indent=2, ensure_ascii=False))
+    print(json.dumps(stats, indent=2, ensure_ascii=False, allow_nan=False))
     return 0
 
 
@@ -259,7 +260,7 @@ def command_search(args: argparse.Namespace) -> int:
         "results": results,
     }
     if args.json_output:
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        print(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
         return 0
 
     if build_stats:
@@ -339,6 +340,7 @@ def command_link(args: argparse.Namespace) -> int:
             },
             indent=2,
             ensure_ascii=False,
+            allow_nan=False,
         )
     )
     return 0
@@ -359,7 +361,7 @@ def command_info(args: argparse.Namespace) -> int:
         index.load()
         payload["index"] = index.metadata
     if args.json_output:
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        print(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
     else:
         print(f"Graph: {payload['graph']}")
         print(

@@ -114,7 +114,7 @@ graphify-out/cache/embeddings.json   model/revision/wrapper/prompt identity, dim
 graphify-out/cache/embeddings.npz    normalized float32 vectors, node IDs, matching generation ID
 ```
 
-Only new or changed node texts are embedded on the next `index` run. Changing the instruction, dtype, backend, pinned model revision, or local wrapper script invalidates the relevant cache identity. A generation ID detects partial/crash-mixed metadata/vector writes, and non-finite or dimension-mismatched caches are rejected. Source context around `source_location` is included when the referenced source file exists.
+Changing the instruction, dtype, backend, pinned model revision, local wrapper script, or document-construction schema invalidates the relevant cache identity. A writer lock serializes concurrent builds; a generation ID detects partial/crash-mixed metadata/vector writes. Non-finite, non-normalized, duplicate-ID, graph-membership, content-hash, row-count, and dimension mismatches are rejected. Only new or changed node texts are embedded on a compatible subsequent `index` run. Source context around `source_location` is included when the referenced source file exists.
 
 ## Models
 
