@@ -17,7 +17,7 @@ import numpy as np
 from .graph import DOCUMENT_SCHEMA, GraphifyGraph
 
 
-CACHE_SCHEMA = 5
+CACHE_SCHEMA = 6
 
 
 class Embedder(Protocol):

@@ -1,0 +1,24 @@
+[worker]
+enabled = true
+auto_start = true
+idle_timeout_seconds = 60
+pressure_poll_seconds = 2
+reranker_enabled = true
+
+[gpu]
+placement_policy = "split"
+preferred_gpu = 0
+secondary_gpu = 1
+embedding_device = "auto"
+reranker_device = "auto"
+min_free_gib = 6
+high_priority_process_mib = 2048
+
+[models]
+# Measured locally: embedder ~15.21 GiB, reranker peak reservation ~16.54 GiB.
+embedding_required_gib = 16
+reranker_required_gib = 17
+
+[attention]
+# auto = flash_attention_2 when flash-attn imports successfully, otherwise sdpa.
+backend = "auto"

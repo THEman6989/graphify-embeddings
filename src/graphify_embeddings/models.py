@@ -122,6 +122,30 @@ def resolve_dtype(dtype: str, device: str):
     return mapping[name]
 
 
+def resolve_attention_backend(requested: str) -> str:
+    value = str(requested).lower()
+    if value == "auto":
+        return (
+            "flash_attention_2"
+            if importlib.util.find_spec("flash_attn") is not None
+            else "sdpa"
+        )
+    if value not in {"sdpa", "flash_attention_2"}:
+        raise ValueError(f"Unsupported attention backend: {requested}")
+    if value == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+        raise RuntimeError(
+            "flash_attention_2 requested but flash-attn is not installed"
+        )
+    return value
+
+
+def _empty_device_cache(torch, device: str) -> None:
+    if not str(device).startswith("cuda") or not torch.cuda.is_available():
+        return
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
+
+
 class QwenEmbedder:
     def __init__(
         self,
@@ -133,6 +157,7 @@ class QwenEmbedder:
         instruction: str = DEFAULT_INSTRUCTION,
         local_files_only: bool = False,
         revision: str | None = None,
+        attention_backend: str = "auto",
     ):
         torch, SentenceTransformer, _ = _imports()
         self.torch = torch
@@ -154,6 +179,7 @@ class QwenEmbedder:
             local_model_fingerprint(local_model) if local_model.is_dir() else None
         )
         self.wrapper_sha256 = None
+        self.attention_backend = resolve_attention_backend(attention_backend)
 
         # Exact backend used by the Comfy custom node: the official model-snapshot
         # Qwen3VLEmbedder and its process([{"text": ...}]) API. No llama.cpp,
@@ -176,6 +202,7 @@ class QwenEmbedder:
                         model_name_or_path=str(model_path),
                         torch_dtype=self.dtype,
                         local_files_only=True,
+                        attn_implementation=self.attention_backend,
                     )
                 except Exception:
                     gc.collect()
@@ -194,7 +221,10 @@ class QwenEmbedder:
         self.model = SentenceTransformer(
             model_name,
             device=self.device,
-            model_kwargs={"torch_dtype": self.dtype},
+            model_kwargs={
+                "torch_dtype": self.dtype,
+                "attn_implementation": self.attention_backend,
+            },
             local_files_only=local_files_only,
             revision=self.revision,
         )
@@ -262,6 +292,7 @@ class QwenEmbedder:
             "wrapper_sha256": self.wrapper_sha256,
             "artifact_fingerprint": self.artifact_fingerprint,
             "dtype": self.requested_dtype,
+            "attention_backend": self.attention_backend,
         }
 
     def encode(
@@ -303,8 +334,7 @@ class QwenEmbedder:
         if model is not None:
             del model
         gc.collect()
-        if self.torch.cuda.is_available():
-            self.torch.cuda.empty_cache()
+        _empty_device_cache(self.torch, self.device)
 
     def __enter__(self):
         return self
@@ -324,6 +354,7 @@ class QwenReranker:
         local_files_only: bool = False,
         max_length: int = 4096,
         revision: str | None = None,
+        attention_backend: str = "auto",
     ):
         torch, _, CrossEncoder = _imports()
         self.torch = torch
@@ -343,6 +374,7 @@ class QwenReranker:
         self.artifact_fingerprint = (
             local_model_fingerprint(local_model) if local_model.is_dir() else None
         )
+        self.attention_backend = resolve_attention_backend(attention_backend)
 
         # sentence-transformers 5.5 cannot reconstruct Qwen's saved LogitScore
         # module from the 5.4 model artifact (missing true_token_id). The official
@@ -368,6 +400,7 @@ class QwenReranker:
                         max_length=max_length,
                         torch_dtype=self.dtype,
                         local_files_only=True,
+                        attn_implementation=self.attention_backend,
                     )
                 except Exception:
                     model_view = getattr(self, "_model_view", None)
@@ -386,7 +419,10 @@ class QwenReranker:
         self.model = CrossEncoder(
             model_name,
             device=self.device,
-            model_kwargs={"torch_dtype": self.dtype},
+            model_kwargs={
+                "torch_dtype": self.dtype,
+                "attn_implementation": self.attention_backend,
+            },
             local_files_only=local_files_only,
             max_length=max_length,
             revision=self.revision,
@@ -510,8 +546,7 @@ class QwenReranker:
         self._model_view = None
         if model_view is not None:
             model_view.cleanup()
-        if self.torch.cuda.is_available():
-            self.torch.cuda.empty_cache()
+        _empty_device_cache(self.torch, self.device)
 
     def __enter__(self):
         return self

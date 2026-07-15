@@ -2,149 +2,206 @@
 
 Local semantic search and reranking for [Graphify](https://github.com/Graphify-Labs/graphify) graphs.
 
-Graphify gives exact AST relationships and BFS/DFS traversal. This tool adds a complementary local retrieval path:
+Graphify provides exact AST relationships and BFS/DFS traversal. This companion adds:
 
-1. embed Graphify nodes with Qwen3-VL-Embedding-8B through the official `Qwen3VLEmbedder.process()` wrapper used by the Comfy custom node;
-2. cache vectors incrementally by node ID + content hash;
-3. retrieve semantic candidates with cosine similarity;
-4. expand each hit through real Graphify edges;
-5. optionally rerank Top-K with Qwen3-VL-Reranker-8B;
-6. optionally write `semantically_similar_to` edges into a Graphify-compatible graph.
+1. embeddings through the official local `Qwen3VLEmbedder.process()` wrapper;
+2. safe incremental node-vector caching;
+3. cosine retrieval plus real Graphify-neighbor expansion;
+4. optional reranking through `Qwen3VLReranker.process()`;
+5. optional Graphify-compatible `semantically_similar_to` edges;
+6. an authenticated local model worker with idle leases and VRAM-pressure eviction.
 
-Everything runs locally and directly through the model's Python wrapper. No API key, llama.cpp, Ollama, or model server is needed.
-
-## Hardware behavior
-
-`--device auto` deliberately chooses the first NVIDIA GPU (`cuda:0`). On Amin's machine that is the RTX 5090. The embedding model is unloaded before the optional 8B reranker is loaded, so both models do not occupy VRAM at the same time.
-
-The Comfy-compatible official VL wrappers require CUDA; `--device cpu` is rejected instead of silently using a GPU. CPU mode remains available only for explicitly selected alternative SentenceTransformers-compatible models.
+Everything runs locally through Python, PyTorch, Transformers and the pinned Qwen wrappers. There is no llama.cpp, Ollama, HTTP API or model server.
 
 ## Install
 
 ```bash
-cd ~/experi/krams/graphify-embeddings
-uv venv
-uv pip install -e '.[gpu]'
+git clone https://github.com/THEman6989/graphify-embeddings.git
+cd graphify-embeddings
+./install.sh
 ```
 
-If the ComfyUI environment already contains Torch and Sentence Transformers:
+The installer:
+
+- creates a dedicated Python 3.11 `.venv`;
+- synchronizes the locked CUDA/Transformers dependencies as a non-editable install;
+- uses a compatible binary `flash-attn` wheel when one exists, otherwise SDPA;
+- verifies CUDA from the new environment;
+- atomically links `~/.local/bin/graphify-embeddings`;
+- creates the default config when absent.
+
+It does not use a ComfyUI virtual environment.
+
+The first model operation downloads the pinned Hugging Face snapshots when they are not already cached. Pass `--local-files-only --no-worker` to an individual index/search command when network access must be forbidden.
 
 ```bash
-/home/amin/experi/sabilitymatrix/Data/Packages/ComfyUI_arc7/venv/bin/python -m pip install -e . --no-deps
+./install.sh --no-flash-attn       # use PyTorch SDPA
+./install.sh --require-flash-attn  # explicitly source-build for the detected GPUs
 ```
 
-## Quick start
-
-Build a Graphify graph first:
+## One-command Graphify pipeline
 
 ```bash
-graphify extract /path/to/repo --code-only
+graphify-embeddings pipeline /path/to/repository
 ```
 
-Index it:
+The stages are deliberately sequential:
+
+1. run `graphify extract`;
+2. retry with `--code-only` if normal extraction fails;
+3. require the completed `graphify-out/graph.json`;
+4. incrementally index the graph;
+5. write `graphify-out/graph.semantic.json` by default;
+6. keep the configured models warm for the lease period.
+
+Embedding never starts before Graphify has produced the graph.
+
+Manual operation remains available:
 
 ```bash
-graphify-embeddings index \
-  --graph /path/to/repo/graphify-out/graph.json
+graphify extract /path/to/repository --code-only
+graphify-embeddings index --graph /path/to/repository/graphify-out/graph.json
+graphify-embeddings link --graph /path/to/repository/graphify-out/graph.json
 ```
 
-Semantic + structural search:
+## Search and reranking
 
 ```bash
 graphify-embeddings search \
   "where is the embedding cache invalidated?" \
-  --graph /path/to/repo/graphify-out/graph.json \
-  --top-k 10 \
-  --neighbors 1
+  --graph /path/to/repository/graphify-out/graph.json \
+  --top-k 10 --neighbors 1
 ```
 
-Add Qwen reranking:
+Reranking is enabled by default in `config.toml`. It can be overridden per request:
 
 ```bash
-graphify-embeddings search \
-  "trace model loading and VRAM cleanup" \
-  --graph /path/to/repo/graphify-out/graph.json \
-  --rerank \
-  --candidate-k 24 \
-  --top-k 8
+graphify-embeddings search "trace VRAM cleanup" --rerank
+graphify-embeddings search "fast embedding-only search" --no-rerank
+graphify-embeddings search "machine output" --json
 ```
 
-Machine-readable output:
+The expensive cross-attention reranker sees only the configured candidate pool.
+
+## Persistent worker and 60-second lease
 
 ```bash
-graphify-embeddings search "semantic query" --graph graphify-out/graph.json --json
+graphify-embeddings worker start
+graphify-embeddings worker status
+graphify-embeddings worker ping --models embedding reranker
+graphify-embeddings worker warm --models embedding reranker
+graphify-embeddings worker unload --models reranker
+graphify-embeddings worker stop
 ```
 
-## Add semantic edges
+The worker uses a same-user Unix socket and random `0600` token below `$XDG_RUNTIME_DIR/graphify-embeddings/`. It opens no TCP port and serializes model operations.
 
-Safe default: write a second graph without touching Graphify's original:
+- A model is unloaded after 60 idle seconds by default.
+- The last validated graph/index pair stays in worker RAM for the same idle lease, avoiding repeated JSON/NPZ parsing and decompression.
+- Graph, metadata or NPZ replacement invalidates the RAM index synchronously; generation IDs and before/after file signatures fail closed.
+- `ping` extends the lease only for models that are already resident.
+- `warm` loads missing models and starts a new lease.
+- `auto_start = false` reuses an already running worker but falls back to one-shot execution instead of spawning one.
+- `--no-worker` uses the one-shot path and closes everything immediately.
+- Stop, SIGTERM, SIGINT and fatal exits close both models and remove runtime files.
+- When the last model and RAM index are evicted, the worker exits to release process RAM and CUDA context VRAM too. The next compatible CLI job auto-starts it unless `auto_start` is disabled.
+
+## Multi-GPU and higher-priority applications
+
+Measured BF16 footprints on the tested host:
+
+```text
+Qwen3-VL-Embedding-8B:  about 15.21 GiB
+Qwen3-VL-Reranker-8B:   about 16.54 GiB peak reservation
+combined:                about 30.43 GiB plus runtime overhead
+RTX 5090 usable total:   about 31.40 GiB
+```
+
+Both models are therefore not safe co-residents on the 5090. Default split placement is:
+
+```text
+Reranker  -> cuda:0 / RTX 5090
+Embedder  -> cuda:1 / RTX 3090
+```
+
+NVML is checked before loads and between requests. The worker evicts models when free VRAM falls below the configured reserve or another process on that GPU crosses the high-priority memory threshold. If possible, the requested model is reloaded on the other GPU; otherwise the request fails safely instead of forcing an OOM. ComfyUI and games therefore override an idle lease or ping.
+
+An already running CUDA kernel cannot be safely interrupted mid-inference. Pressure protection applies before requests and between requests, not by killing active kernels.
+
+The official VL wrappers are CUDA-only. `--device cpu` is rejected instead of silently selecting a GPU.
+
+## Configuration
 
 ```bash
-graphify-embeddings link --graph graphify-out/graph.json --threshold 0.82
-# writes graphify-out/graph.semantic.json
+graphify-embeddings config path
+graphify-embeddings config init
+graphify-embeddings config show
 ```
 
-Explicit in-place update:
+See `config.example.toml`. Important options:
 
-```bash
-graphify-embeddings link --graph graphify-out/graph.json --threshold 0.82 --in-place
-# creates graphify-out/graph.json.bak first
+```toml
+[worker]
+enabled = true
+auto_start = true
+idle_timeout_seconds = 60
+reranker_enabled = true
+
+[gpu]
+placement_policy = "split"
+preferred_gpu = 0
+secondary_gpu = 1
+min_free_gib = 6
+high_priority_process_mib = 2048
+
+[attention]
+backend = "auto" # flash_attention_2 when importable, otherwise sdpa
 ```
 
-Edges use Graphify's real `links` schema:
-
-```json
-{
-  "source": "node-a",
-  "target": "node-b",
-  "relation": "semantically_similar_to",
-  "type": "semantically_similar_to",
-  "confidence": "INFERRED",
-  "confidence_score": 0.87,
-  "weight": 0.87
-}
-```
+CLI `--rerank` and `--no-rerank` override the configured reranker default for one search.
 
 ## Cache files
 
-Beside the graph:
-
 ```text
-graphify-out/cache/embeddings.json   model/revision/wrapper/prompt identity, dimensions, content hashes, generation ID
-graphify-out/cache/embeddings.npz    normalized float32 vectors, node IDs, matching generation ID
+graphify-out/cache/embeddings.json  identity, hashes, dimensions, generation
+graphify-out/cache/embeddings.npz   normalized float32 vectors and node IDs
+graphify-out/cache/.embeddings.lock serialized writer lock
+graphify-out/graph.semantic.json     optional semantic Graphify graph
 ```
 
-Changing the instruction, dtype, backend, pinned model revision, local model artifact, local wrapper script, or document-construction schema invalidates the relevant cache identity. Local VL wrapper scripts must match the audited official SHA-256; mutable custom Python is never executed. Alternative remote models require an explicit immutable 40-character commit revision. A writer lock serializes concurrent builds; a generation ID detects partial/crash-mixed metadata/vector writes. Non-finite, non-normalized, duplicate-ID, graph-membership, content-hash, row-count, and dimension mismatches are rejected. Only new or changed node texts are embedded on a compatible subsequent `index` run. Source context around `source_location` is included when the referenced source file exists.
+The cache is JSON+NPZ rather than SQLite because retrieval uses one contiguous dense matrix. Cache schema 6 includes model/revision, exact wrapper SHA-256, local artifact fingerprint, instruction, dtype, attention backend and document schema. Any mismatch invalidates reuse.
 
-## Models
+Publication is atomic and generation-paired. Non-finite or non-normalized vectors, duplicate IDs, graph-membership mismatch, dimensions, incomplete hashes and mixed generations fail closed.
+
+## Model trust boundary
 
 Defaults:
 
 - `Qwen/Qwen3-VL-Embedding-8B`
 - `Qwen/Qwen3-VL-Reranker-8B`
 
-The text-only equivalents can be selected explicitly:
+The exact official wrapper bytes must match pinned SHA-256 values before those same bytes are compiled and executed. Alternative remote models require explicit immutable 40-character revisions. Local model directories receive an artifact fingerprint.
 
 ```bash
 graphify-embeddings index \
   --embedding-model Qwen/Qwen3-Embedding-8B \
-  --embedding-revision <40-character-commit>
-graphify-embeddings search "..." --rerank \
-  --reranker-model Qwen/Qwen3-Reranker-8B \
-  --reranker-revision <40-character-commit>
+  --embedding-revision <40-character-commit> \
+  --no-worker
 ```
 
 ## Why both Graphify and embeddings?
 
-- Graphify edges answer exact structural questions: calls, imports, ownership, paths.
-- Qwen embeddings recover naming variants, cross-language concepts and semantically similar code.
-- The reranker spends expensive cross-attention only on a small candidate set.
-- `--neighbors` attaches actual Graphify relationships to semantic hits rather than pretending cosine similarity is a call edge.
+- Graphify answers exact structural questions: calls, imports, ownership and paths.
+- Embeddings recover naming variants, cross-language concepts and semantic similarity.
+- `--neighbors` attaches real Graphify relations instead of pretending cosine similarity is a call edge.
+- Reranking applies expensive cross-attention only to a small candidate set.
 
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v
+.venv/bin/python -m unittest discover -s tests -v
+uvx ruff check src tests
+uvx ruff format --check src tests
 ```
 
 Apache-2.0 licensed.
