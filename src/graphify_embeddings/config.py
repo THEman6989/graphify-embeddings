@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import math
 import re
 import tomllib
@@ -80,6 +82,18 @@ class WorkerConfig:
                 "attention_backend must be auto, sdpa, or flash_attention_2"
             )
         return self
+
+
+def config_fingerprint(config: WorkerConfig) -> str:
+    payload = {
+        item.name: getattr(config, item.name)
+        for item in fields(config)
+        if item.name not in {"worker_enabled", "auto_start"}
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _flatten(data: dict[str, Any]) -> dict[str, Any]:

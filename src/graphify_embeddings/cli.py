@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .client import RuntimePaths, WorkerClient, WorkerError, ensure_worker
+from .client import (
+    RuntimePaths,
+    WorkerClient,
+    WorkerError,
+    ensure_worker,
+    require_worker_config,
+)
 from .config import WorkerConfig, default_config_path, load_config
 from .graph import DOCUMENT_SCHEMA, GraphifyGraph
 from .index import EmbeddingIndex
@@ -232,7 +241,7 @@ def _worker_client(
         return ensure_worker(config_path=getattr(args, "config", None))
     client = WorkerClient(RuntimePaths.defaults())
     try:
-        client.request("status")
+        require_worker_config(client, getattr(args, "config", None))
     except WorkerError:
         return None
     return client
@@ -576,16 +585,53 @@ def command_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _worker_runtime_released(paths: RuntimePaths) -> bool:
+    if any(path.exists() for path in (paths.socket, paths.pid, paths.token)):
+        return False
+    lock_path = paths.socket.parent / "worker.lock"
+    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags)
+    except FileNotFoundError:
+        return True
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def _wait_for_worker_exit(paths: RuntimePaths, *, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not _worker_runtime_released(paths):
+        if time.monotonic() >= deadline:
+            raise WorkerError("Worker did not finish stopping within 5 seconds")
+        time.sleep(0.05)
+
+
 def command_worker(args: argparse.Namespace) -> int:
     if args.worker_action == "start":
         client = ensure_worker(config_path=args.config)
         result = client.request("status")
+    elif args.worker_action == "stop":
+        paths = RuntimePaths.defaults()
+        client = WorkerClient(paths)
+        result = client.request("stop", {})
+        _wait_for_worker_exit(paths)
     else:
         client = WorkerClient(RuntimePaths.defaults())
-        payload = {}
-        if args.worker_action in {"ping", "warm", "unload"}:
-            payload["models"] = args.models
-        result = client.request(args.worker_action, payload)
+        status = require_worker_config(client, args.config)
+        if args.worker_action == "status":
+            result = status
+        else:
+            payload = {}
+            if args.worker_action in {"ping", "warm", "unload"}:
+                payload["models"] = args.models
+            result = client.request(args.worker_action, payload)
     print(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False))
     return 0
 

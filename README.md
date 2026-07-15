@@ -102,6 +102,7 @@ The worker uses a same-user Unix socket and random `0600` token below `$XDG_RUNT
 - `ping` extends the lease only for models that are already resident.
 - `warm` loads missing models and starts a new lease.
 - `auto_start = false` reuses an already running worker but falls back to one-shot execution instead of spawning one.
+- Runtime-affecting config changes require `graphify-embeddings worker stop` first; commands never reuse a worker whose effective config fingerprint differs from `--config`.
 - `--no-worker` uses the one-shot path and closes everything immediately.
 - Stop, SIGTERM, SIGINT and fatal exits close both models and remove runtime files.
 - When the last model and RAM index are evicted, the worker exits to release process RAM and CUDA context VRAM too. The next compatible CLI job auto-starts it unless `auto_start` is disabled.

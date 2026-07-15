@@ -14,13 +14,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import default_runtime_dir
+from .config import config_fingerprint, default_runtime_dir, load_config
 
 
 MAX_MESSAGE_BYTES = 1024 * 1024
 
 
 class WorkerError(RuntimeError):
+    pass
+
+
+class WorkerConfigMismatch(WorkerError):
     pass
 
 
@@ -84,9 +88,27 @@ class WorkerClient:
             decoded = json.loads(bytes(response))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise WorkerError("Worker returned an invalid response") from exc
+        if not isinstance(decoded, dict):
+            raise WorkerError("Worker returned a non-object response")
         if not decoded.get("ok"):
             raise WorkerError(str(decoded.get("error", "Worker request failed")))
         return decoded.get("result")
+
+
+def require_worker_config(
+    client: WorkerClient, config_path: str | None = None
+) -> dict[str, Any]:
+    expected = config_fingerprint(load_config(config_path))
+    status = client.request("status")
+    if not isinstance(status, dict):
+        raise WorkerError("Worker returned an invalid status response")
+    actual = status.get("config_fingerprint")
+    if actual != expected:
+        raise WorkerConfigMismatch(
+            "Running worker configuration does not match the requested configuration; "
+            "stop the worker before switching configs"
+        )
+    return status
 
 
 @contextmanager
@@ -123,14 +145,18 @@ def ensure_worker(
     paths = paths or RuntimePaths.defaults()
     client = WorkerClient(paths)
     try:
-        client.request("status")
+        require_worker_config(client, config_path)
         return client
+    except WorkerConfigMismatch:
+        raise
     except WorkerError:
         pass
     with _startup_lock(paths):
         try:
-            client.request("status")
+            require_worker_config(client, config_path)
             return client
+        except WorkerConfigMismatch:
+            raise
         except WorkerError:
             pass
         command = [sys.executable, "-I", "-m", "graphify_embeddings.worker"]
@@ -154,15 +180,22 @@ def ensure_worker(
                 env=environment,
             )
         deadline = time.monotonic() + startup_timeout
+        child_exit_seen_at: float | None = None
         last_error = "worker did not become ready"
         while time.monotonic() < deadline:
-            if process.poll() is not None:
-                last_error = f"worker exited with code {process.returncode}"
-                break
             try:
-                client.request("status")
+                require_worker_config(client, config_path)
                 return client
+            except WorkerConfigMismatch:
+                raise
             except WorkerError as exc:
                 last_error = str(exc)
-                time.sleep(0.05)
+            returncode = process.poll()
+            if returncode is not None:
+                now = time.monotonic()
+                child_exit_seen_at = child_exit_seen_at or now
+                last_error = f"worker exited with code {returncode}"
+                if now - child_exit_seen_at >= 1.0:
+                    break
+            time.sleep(0.05)
         raise WorkerError(f"Could not start worker: {last_error}; log: {log_path}")

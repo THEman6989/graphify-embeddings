@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .client import MAX_MESSAGE_BYTES, RuntimePaths
-from .config import load_config
+from .config import config_fingerprint, load_config
 from .manager import ModelManager
 from .models import QwenEmbedder, QwenReranker
 from .service import ModelService
@@ -44,7 +44,13 @@ class _RequestHandler(socketserver.StreamRequestHandler):
         except Exception as exc:
             owner._respond(self.wfile, False, error=str(exc))
             return
-        raw = self.rfile.readline(MAX_MESSAGE_BYTES + 1)
+        self.request.settimeout(owner.read_timeout)
+        try:
+            raw = self.rfile.readline(MAX_MESSAGE_BYTES + 1)
+        except (socket.timeout, TimeoutError):
+            return
+        if not raw:
+            return
         if len(raw) > MAX_MESSAGE_BYTES:
             owner._respond(self.wfile, False, error="Request exceeds the size limit")
             return
@@ -80,12 +86,16 @@ class WorkerServer:
         operations: dict[str, Operation] | None = None,
         service: Any | None = None,
         poll_interval: float = 0.5,
+        read_timeout: float = 1.0,
+        config_identity: str | None = None,
     ):
         self.manager = manager
         self.paths = paths or RuntimePaths.defaults()
         self.operations = operations or {}
         self.service = service
         self.poll_interval = poll_interval
+        self.read_timeout = read_timeout
+        self.config_identity = config_identity
         self.token = ""
         self._stopping = False
         self._server: _UnixServer | None = None
@@ -160,13 +170,17 @@ class WorkerServer:
         )
         if len(encoded) > MAX_MESSAGE_BYTES:
             encoded = b'{"ok":false,"error":"Response exceeds the size limit"}\n'
-        stream.write(encoded)
-        stream.flush()
+        try:
+            stream.write(encoded)
+            stream.flush()
+        except OSError:
+            return
 
     def dispatch(self, action: str, payload: dict[str, Any]) -> Any:
         if action == "status":
             return {
                 "pid": os.getpid(),
+                "config_fingerprint": self.config_identity,
                 "models": self.manager.status(),
                 "index": self.service.status() if self.service is not None else None,
             }
@@ -283,6 +297,7 @@ def create_default_server(config_path: str | None = None) -> WorkerServer:
         operations={"index": service.index, "search": service.search},
         service=service,
         poll_interval=min(0.5, config.pressure_poll_seconds),
+        config_identity=config_fingerprint(config),
     )
 
 

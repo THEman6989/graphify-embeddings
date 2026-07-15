@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import tempfile
 import threading
@@ -8,14 +9,16 @@ import time
 import unittest
 import json
 import os
+import socket
 import subprocess
 import struct
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
-from graphify_embeddings.config import WorkerConfig, load_config
+from graphify_embeddings.config import WorkerConfig, config_fingerprint, load_config
 from graphify_embeddings import cli
 from graphify_embeddings import worker as worker_module
 from graphify_embeddings.gpu import (
@@ -321,9 +324,16 @@ if sys.argv[1] == "venv":
         from unittest.mock import patch
 
         args = cli.build_parser().parse_args(["index"])
-        config = WorkerConfig(auto_start=False)
+        config = replace(load_config(None), auto_start=False)
         with (
-            patch.object(WorkerClient, "request", return_value={"pid": 123}),
+            patch.object(
+                WorkerClient,
+                "request",
+                return_value={
+                    "pid": 123,
+                    "config_fingerprint": config_fingerprint(config),
+                },
+            ),
             patch("graphify_embeddings.cli.ensure_worker") as spawn,
         ):
             client = cli._worker_client(args, config)
@@ -416,6 +426,29 @@ min_free_gib = 4.5
                 with self.subTest(field=field, value=value):
                     with self.assertRaisesRegex(ValueError, "GiB"):
                         invalid_config.validate()
+
+    def test_runtime_config_fingerprint_is_stable_and_specific(self):
+        base = WorkerConfig(attention_backend="sdpa")
+        client_only_change = replace(base, auto_start=False, worker_enabled=False)
+        runtime_change = replace(base, attention_backend="flash_attention_2")
+        self.assertEqual(
+            config_fingerprint(base), config_fingerprint(client_only_change)
+        )
+        self.assertNotEqual(
+            config_fingerprint(base), config_fingerprint(runtime_change)
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "worker.toml"
+            config_path.write_text('[attention]\nbackend = "sdpa"\n', encoding="utf-8")
+            server = worker_module.create_default_server(str(config_path))
+            try:
+                self.assertEqual(
+                    server.dispatch("status", {})["config_fingerprint"],
+                    config_fingerprint(load_config(config_path)),
+                )
+            finally:
+                server._close_resources()
 
     def test_split_placement_uses_5090_for_reranker_and_3090_for_embedder(self):
         gpus = [
@@ -880,6 +913,7 @@ class WorkerIpcTests(unittest.TestCase):
             calls: dict[int, int] = {}
             started = [False]
             spawn_count = [0]
+            expected_fingerprint = config_fingerprint(load_config(None))
 
             def request(_client, _action, _payload=None):
                 ident = threading.get_ident()
@@ -891,7 +925,10 @@ class WorkerIpcTests(unittest.TestCase):
                     barrier.wait(timeout=2)
                     raise WorkerError("not running")
                 if ready:
-                    return {"pid": 123}
+                    return {
+                        "pid": 123,
+                        "config_fingerprint": expected_fingerprint,
+                    }
                 raise WorkerError("not running")
 
             class FakeProcess:
@@ -939,10 +976,11 @@ class WorkerIpcTests(unittest.TestCase):
             )
             config = root / "config.toml"
             config.write_text("[worker]\n", encoding="utf-8")
+            expected_fingerprint = config_fingerprint(load_config(config))
             requests = [
                 WorkerError("not running"),
                 WorkerError("not running"),
-                {"pid": 123},
+                {"pid": 123, "config_fingerprint": expected_fingerprint},
             ]
             popen_calls = []
 
@@ -981,8 +1019,125 @@ class WorkerIpcTests(unittest.TestCase):
             self.assertNotIn("PYTHONPATH", kwargs["env"])
             self.assertNotIn("PYTHONHOME", kwargs["env"])
 
+    def test_autostart_reuses_compatible_winner_after_spawned_child_exits(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = RuntimePaths(
+                root / "worker.sock", root / "worker.pid", root / "worker.token"
+            )
+            expected = config_fingerprint(load_config(None))
+            requests = [
+                WorkerError("not running"),
+                WorkerError("not running"),
+                {"pid": 321, "config_fingerprint": expected},
+            ]
+
+            def request(_client, _action, _payload=None):
+                result = requests.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+            class LostRaceProcess:
+                returncode = 1
+
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                @staticmethod
+                def poll():
+                    return 1
+
+            with (
+                patch.object(WorkerClient, "request", request),
+                patch("graphify_embeddings.client.subprocess.Popen", LostRaceProcess),
+            ):
+                client = ensure_worker(paths=paths, startup_timeout=1)
+            self.assertIsInstance(client, WorkerClient)
+            self.assertEqual(requests, [])
+
+    def test_existing_worker_with_different_config_is_not_reused(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = RuntimePaths(
+                root / "worker.sock", root / "worker.pid", root / "worker.token"
+            )
+            config = root / "config.toml"
+            config.write_text('[attention]\nbackend = "sdpa"\n', encoding="utf-8")
+            with (
+                patch.object(
+                    WorkerClient,
+                    "request",
+                    return_value={"pid": 123, "config_fingerprint": "wrong"},
+                ),
+                patch("graphify_embeddings.client.subprocess.Popen") as spawn,
+                self.assertRaisesRegex(WorkerError, "configuration does not match"),
+            ):
+                ensure_worker(config_path=str(config), paths=paths)
+            spawn.assert_not_called()
+
     def test_default_client_timeout_supports_large_model_loads(self):
         self.assertGreaterEqual(WorkerClient().timeout, 600.0)
+
+    def test_worker_management_rejects_mismatched_config_except_stop(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            config.write_text('[attention]\nbackend = "sdpa"\n', encoding="utf-8")
+            warm_args = cli.build_parser().parse_args(
+                ["--config", str(config), "worker", "warm", "--models", "reranker"]
+            )
+            with (
+                patch.object(
+                    WorkerClient,
+                    "request",
+                    return_value={"config_fingerprint": "wrong"},
+                ) as request,
+                self.assertRaisesRegex(WorkerError, "configuration does not match"),
+            ):
+                cli.command_worker(warm_args)
+            request.assert_called_once_with("status")
+
+            stop_args = cli.build_parser().parse_args(
+                ["--config", str(config), "worker", "stop"]
+            )
+            with (
+                patch.object(
+                    WorkerClient,
+                    "request",
+                    return_value={"stopping": True},
+                ) as request,
+                patch("graphify_embeddings.cli._wait_for_worker_exit") as wait,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(cli.command_worker(stop_args), 0)
+            request.assert_called_once_with("stop", {})
+            wait.assert_called_once()
+
+            runtime_root = Path(temporary) / "runtime"
+            runtime_root.mkdir()
+            paths = RuntimePaths(
+                runtime_root / "worker.sock",
+                runtime_root / "worker.pid",
+                runtime_root / "worker.token",
+            )
+            lock_fd = os.open(
+                runtime_root / "worker.lock", os.O_RDWR | os.O_CREAT, 0o600
+            )
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                self.assertFalse(cli._worker_runtime_released(paths))
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            self.assertTrue(cli._worker_runtime_released(paths))
+            paths.socket.touch()
+            self.assertFalse(cli._worker_runtime_released(paths))
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -1033,6 +1188,16 @@ class WorkerIpcTests(unittest.TestCase):
         self.assertFalse(self.paths.socket.exists())
         self.assertFalse(self.paths.pid.exists())
         self.assertFalse(self.paths.token.exists())
+
+    def test_stalled_peer_times_out_and_maintenance_resumes(self):
+        self.server.read_timeout = 0.05
+        ticks_before = self.manager.ticks
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stalled:
+            stalled.connect(str(self.paths.socket))
+            time.sleep(0.15)
+            status = self.client.request("status")
+        self.assertEqual(status["pid"], os.getpid())
+        self.assertGreater(self.manager.ticks, ticks_before)
 
     def test_authentication_and_unknown_actions_fail_closed(self):
         original = self.paths.token.read_text(encoding="ascii")
