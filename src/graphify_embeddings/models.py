@@ -4,6 +4,8 @@ import gc
 import hashlib
 import importlib.util
 import os
+import re
+import sys
 import tempfile
 from pathlib import Path
 from typing import Sequence
@@ -22,6 +24,49 @@ DEFAULT_RERANKER_WRAPPER_SHA256 = (
     "bd5d2f5d97fc4a738864d93f6b15d8850243e60da4484f3ea78867a46efdebd6"
 )
 DEFAULT_INSTRUCTION = "Retrieve code graph nodes relevant to the user's query."
+_IMMUTABLE_REVISION_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def local_model_fingerprint(model_path: str | Path) -> str:
+    """Fingerprint a mutable local model tree without rereading multi-GB weights."""
+    root = Path(model_path).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"Local model directory does not exist: {root}")
+    digest = hashlib.sha256()
+    for entry in sorted(path for path in root.rglob("*") if path.is_file()):
+        stat = entry.stat()
+        relative = entry.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(f"\0{stat.st_size}\0{stat.st_mtime_ns}\0".encode())
+        if stat.st_size <= 1024 * 1024:
+            digest.update(entry.read_bytes())
+    return digest.hexdigest()
+
+
+def resolve_model_revision(
+    model_name: str,
+    revision: str | None,
+    *,
+    default_model: str,
+    default_revision: str,
+) -> str | None:
+    local = Path(model_name).expanduser()
+    if local.is_dir():
+        if revision:
+            raise ValueError("Do not combine a local model directory with a revision")
+        return None
+    if model_name == default_model:
+        if revision and revision != default_revision:
+            raise ValueError(
+                f"The default model is pinned to immutable revision {default_revision}"
+            )
+        return default_revision
+    if not revision or not _IMMUTABLE_REVISION_RE.fullmatch(revision.lower()):
+        raise ValueError(
+            "Alternative remote models require an immutable 40-character commit "
+            "revision"
+        )
+    return revision.lower()
 
 
 def _imports():
@@ -43,10 +88,11 @@ def resolve_device(requested: str = "auto") -> str:
             torch.cuda.set_device(0)
             return "cuda:0"
         return "cpu"
-    if requested.startswith("cuda"):
+    match = re.fullmatch(r"cuda(?::(\d+))?", requested)
+    if match:
         if not torch.cuda.is_available():
             raise RuntimeError(f"CUDA requested ({requested}) but CUDA is unavailable")
-        index = int(requested.split(":", 1)[1]) if ":" in requested else 0
+        index = int(match.group(1) or 0)
         if index >= torch.cuda.device_count():
             raise RuntimeError(
                 f"CUDA device {index} does not exist; found {torch.cuda.device_count()} device(s)"
@@ -86,6 +132,7 @@ class QwenEmbedder:
         batch_size: int = 4,
         instruction: str = DEFAULT_INSTRUCTION,
         local_files_only: bool = False,
+        revision: str | None = None,
     ):
         torch, SentenceTransformer, _ = _imports()
         self.torch = torch
@@ -96,10 +143,15 @@ class QwenEmbedder:
         self.batch_size = max(1, int(batch_size))
         self.instruction = instruction
         self.backend = "sentence_transformers"
-        self.revision = (
-            DEFAULT_EMBEDDING_REVISION
-            if model_name == DEFAULT_EMBEDDING_MODEL
-            else None
+        self.revision = resolve_model_revision(
+            model_name,
+            revision,
+            default_model=DEFAULT_EMBEDDING_MODEL,
+            default_revision=DEFAULT_EMBEDDING_REVISION,
+        )
+        local_model = Path(model_name).expanduser()
+        self.artifact_fingerprint = (
+            local_model_fingerprint(local_model) if local_model.is_dir() else None
         )
         self.wrapper_sha256 = None
 
@@ -118,15 +170,7 @@ class QwenEmbedder:
                         "The official Qwen3-VL embedding wrapper used by the Comfy node "
                         "requires CUDA; choose --device cuda:N"
                     )
-                self.wrapper_sha256 = hashlib.sha256(script.read_bytes()).hexdigest()
-                if (
-                    model_name == DEFAULT_EMBEDDING_MODEL
-                    and self.wrapper_sha256 != DEFAULT_EMBEDDING_WRAPPER_SHA256
-                ):
-                    raise RuntimeError(
-                        "Pinned Qwen embedding wrapper failed SHA-256 verification"
-                    )
-                wrapper_class = self._load_wrapper(script)
+                wrapper_class, self.wrapper_sha256 = self._load_wrapper(script)
                 try:
                     self.model = wrapper_class(
                         model_name_or_path=str(model_path),
@@ -152,6 +196,7 @@ class QwenEmbedder:
             device=self.device,
             model_kwargs={"torch_dtype": self.dtype},
             local_files_only=local_files_only,
+            revision=self.revision,
         )
 
     @staticmethod
@@ -180,16 +225,33 @@ class QwenEmbedder:
 
     @staticmethod
     def _load_wrapper(script: Path):
+        source = script.read_bytes()
+        wrapper_sha256 = hashlib.sha256(source).hexdigest()
+        if wrapper_sha256 != DEFAULT_EMBEDDING_WRAPPER_SHA256:
+            raise RuntimeError(
+                "Qwen embedding wrapper failed official SHA-256 verification"
+            )
         module_name = "graphify_embeddings._qwen3_vl_embedding"
         spec = importlib.util.spec_from_file_location(module_name, script)
         if spec is None or spec.loader is None:
             raise RuntimeError(f"Cannot load official Qwen embedding wrapper: {script}")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        previous_module = sys.modules.get(module_name)
+        sys.modules[module_name] = module
+        try:
+            code = compile(source, str(script), "exec", dont_inherit=True)
+            # Exact bytes above matched the pinned official SHA-256.
+            exec(code, module.__dict__)  # nosec B102
+        except Exception:
+            if previous_module is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = previous_module
+            raise
         wrapper = getattr(module, "Qwen3VLEmbedder", None)
         if wrapper is None:
             raise RuntimeError(f"Qwen3VLEmbedder class missing in {script}")
-        return wrapper
+        return wrapper, wrapper_sha256
 
     def cache_identity(self) -> dict[str, str | None]:
         return {
@@ -198,6 +260,7 @@ class QwenEmbedder:
             "instruction": self.instruction,
             "revision": self.revision,
             "wrapper_sha256": self.wrapper_sha256,
+            "artifact_fingerprint": self.artifact_fingerprint,
             "dtype": self.requested_dtype,
         }
 
@@ -260,6 +323,7 @@ class QwenReranker:
         instruction: str = DEFAULT_INSTRUCTION,
         local_files_only: bool = False,
         max_length: int = 4096,
+        revision: str | None = None,
     ):
         torch, _, CrossEncoder = _imports()
         self.torch = torch
@@ -269,8 +333,15 @@ class QwenReranker:
         self.dtype = resolve_dtype(dtype, self.device)
         self.instruction = instruction
         self.backend = "cross_encoder"
-        self.revision = (
-            DEFAULT_RERANKER_REVISION if model_name == DEFAULT_RERANKER_MODEL else None
+        self.revision = resolve_model_revision(
+            model_name,
+            revision,
+            default_model=DEFAULT_RERANKER_MODEL,
+            default_revision=DEFAULT_RERANKER_REVISION,
+        )
+        local_model = Path(model_name).expanduser()
+        self.artifact_fingerprint = (
+            local_model_fingerprint(local_model) if local_model.is_dir() else None
         )
 
         # sentence-transformers 5.5 cannot reconstruct Qwen's saved LogitScore
@@ -289,15 +360,7 @@ class QwenReranker:
                         "The official Qwen3-VL reranker wrapper used by the Comfy node "
                         "requires CUDA; choose --device cuda:N"
                     )
-                wrapper_sha256 = hashlib.sha256(script.read_bytes()).hexdigest()
-                if (
-                    model_name == DEFAULT_RERANKER_MODEL
-                    and wrapper_sha256 != DEFAULT_RERANKER_WRAPPER_SHA256
-                ):
-                    raise RuntimeError(
-                        "Pinned Qwen reranker wrapper failed SHA-256 verification"
-                    )
-                wrapper_class = self._load_wrapper(script)
+                wrapper_class, self.wrapper_sha256 = self._load_wrapper(script)
                 load_path = self._processor_compatible_view(model_path)
                 try:
                     self.model = wrapper_class(
@@ -326,6 +389,7 @@ class QwenReranker:
             model_kwargs={"torch_dtype": self.dtype},
             local_files_only=local_files_only,
             max_length=max_length,
+            revision=self.revision,
         )
 
     @staticmethod
@@ -375,16 +439,33 @@ class QwenReranker:
 
     @staticmethod
     def _load_wrapper(script: Path):
+        source = script.read_bytes()
+        wrapper_sha256 = hashlib.sha256(source).hexdigest()
+        if wrapper_sha256 != DEFAULT_RERANKER_WRAPPER_SHA256:
+            raise RuntimeError(
+                "Qwen reranker wrapper failed official SHA-256 verification"
+            )
         module_name = "graphify_embeddings._qwen3_vl_reranker"
         spec = importlib.util.spec_from_file_location(module_name, script)
         if spec is None or spec.loader is None:
             raise RuntimeError(f"Cannot load official Qwen reranker wrapper: {script}")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        previous_module = sys.modules.get(module_name)
+        sys.modules[module_name] = module
+        try:
+            code = compile(source, str(script), "exec", dont_inherit=True)
+            # Exact bytes above matched the pinned official SHA-256.
+            exec(code, module.__dict__)  # nosec B102
+        except Exception:
+            if previous_module is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = previous_module
+            raise
         wrapper = getattr(module, "Qwen3VLReranker", None)
         if wrapper is None:
             raise RuntimeError(f"Qwen3VLReranker class missing in {script}")
-        return wrapper
+        return wrapper, wrapper_sha256
 
     def score(
         self, query: str, documents: Sequence[str], batch_size: int = 1

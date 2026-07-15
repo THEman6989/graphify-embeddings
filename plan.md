@@ -38,8 +38,9 @@ graphify-embeddings index
 
 ```text
 graphify-out/cache/embeddings.json
-  schema version, generation ID, immutable model revision, verified wrapper SHA-256,
-  backend/instruction/dtype identity, dimension, node/content hashes, source-context mode
+  schema version, generation ID, immutable model revision or local artifact fingerprint,
+  verified official wrapper SHA-256, backend/instruction/dtype identity, dimension,
+  node/content hashes, source-context mode
 
 graphify-out/cache/embeddings.npz
   matching generation ID + node IDs + normalized float32 matrix

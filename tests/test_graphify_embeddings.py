@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -16,9 +20,13 @@ from graphify_embeddings.graph import GraphifyGraph
 from graphify_embeddings.index import EmbeddingIndex
 from graphify_embeddings.models import (
     DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_REVISION,
     DEFAULT_RERANKER_MODEL,
     QwenEmbedder,
     QwenReranker,
+    local_model_fingerprint,
+    resolve_device,
+    resolve_model_revision,
 )
 
 
@@ -86,6 +94,31 @@ class FakeReranker:
             [0.99 if "rerank" in document.lower() else 0.10 for document in documents],
             dtype=np.float32,
         )
+
+
+class FakeTorch:
+    float32 = object()
+    float16 = object()
+    bfloat16 = object()
+
+    class cuda:
+        selected = None
+
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 2
+
+        @classmethod
+        def set_device(cls, index):
+            cls.selected = index
+
+        @staticmethod
+        def empty_cache():
+            return None
 
 
 class GraphifyEmbeddingTests(unittest.TestCase):
@@ -344,7 +377,13 @@ class GraphifyEmbeddingTests(unittest.TestCase):
         (embedding_model / "qwen3_vl_embedding.py").write_text(
             "# fixture", encoding="utf-8"
         )
-        with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
+        with (
+            patch(
+                "graphify_embeddings.models._imports",
+                return_value=(FakeTorch, None, None),
+            ),
+            self.assertRaisesRegex(RuntimeError, "requires CUDA"),
+        ):
             QwenEmbedder(str(embedding_model.parent), device="cpu")
 
         reranker_model = self.root / "reranker-model" / "scripts"
@@ -352,13 +391,23 @@ class GraphifyEmbeddingTests(unittest.TestCase):
         (reranker_model / "qwen3_vl_reranker.py").write_text(
             "# fixture", encoding="utf-8"
         )
-        with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
+        with (
+            patch(
+                "graphify_embeddings.models._imports",
+                return_value=(FakeTorch, None, None),
+            ),
+            self.assertRaisesRegex(RuntimeError, "requires CUDA"),
+        ):
             QwenReranker(str(reranker_model.parent), device="cpu")
 
     def test_default_vl_models_fail_closed_when_wrapper_is_missing(self):
         empty_snapshot = self.root / "empty-snapshot"
         empty_snapshot.mkdir()
         with (
+            patch(
+                "graphify_embeddings.models._imports",
+                return_value=(FakeTorch, None, None),
+            ),
             patch.object(
                 QwenEmbedder,
                 "_resolve_model_path",
@@ -368,6 +417,10 @@ class GraphifyEmbeddingTests(unittest.TestCase):
         ):
             QwenEmbedder(DEFAULT_EMBEDDING_MODEL, device="cuda:0")
         with (
+            patch(
+                "graphify_embeddings.models._imports",
+                return_value=(FakeTorch, None, None),
+            ),
             patch.object(
                 QwenReranker,
                 "_resolve_model_path",
@@ -376,6 +429,96 @@ class GraphifyEmbeddingTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "reranker wrapper is missing"),
         ):
             QwenReranker(DEFAULT_RERANKER_MODEL, device="cuda:0")
+
+    def test_local_model_fingerprint_and_wrapper_trust_boundary(self):
+        model = self.root / "mutable-model"
+        scripts = model / "scripts"
+        scripts.mkdir(parents=True)
+        config = model / "config.json"
+        config.write_text('{"version": 1}', encoding="utf-8")
+        first = local_model_fingerprint(model)
+        config.write_text('{"version": 2}', encoding="utf-8")
+        second = local_model_fingerprint(model)
+        self.assertNotEqual(first, second)
+
+        (scripts / "qwen3_vl_embedding.py").write_text(
+            "# untrusted local code", encoding="utf-8"
+        )
+        with (
+            patch(
+                "graphify_embeddings.models._imports",
+                return_value=(FakeTorch, None, None),
+            ),
+            self.assertRaisesRegex(RuntimeError, "official SHA-256"),
+        ):
+            QwenEmbedder(str(model), device="cuda:0")
+
+        (scripts / "qwen3_vl_embedding.py").unlink()
+        (scripts / "qwen3_vl_reranker.py").write_text(
+            "# untrusted local code", encoding="utf-8"
+        )
+        with (
+            patch(
+                "graphify_embeddings.models._imports",
+                return_value=(FakeTorch, None, None),
+            ),
+            self.assertRaisesRegex(RuntimeError, "official SHA-256"),
+        ):
+            QwenReranker(str(model), device="cuda:0")
+
+    def test_verified_wrapper_executes_exact_bytes_without_future_inheritance(self):
+        script = self.root / "verified_wrapper.py"
+        source = b"class Qwen3VLEmbedder:\n    value: int\n"
+        script.write_bytes(source)
+        expected = hashlib.sha256(source).hexdigest()
+        try:
+            with patch(
+                "graphify_embeddings.models.DEFAULT_EMBEDDING_WRAPPER_SHA256",
+                expected,
+            ):
+                wrapper, actual = QwenEmbedder._load_wrapper(script)
+            self.assertEqual(actual, expected)
+            self.assertIs(wrapper.__annotations__["value"], int)
+        finally:
+            sys.modules.pop("graphify_embeddings._qwen3_vl_embedding", None)
+
+    def test_remote_revisions_and_cuda_device_syntax_are_strict(self):
+        self.assertEqual(
+            resolve_model_revision(
+                DEFAULT_EMBEDDING_MODEL,
+                None,
+                default_model=DEFAULT_EMBEDDING_MODEL,
+                default_revision=DEFAULT_EMBEDDING_REVISION,
+            ),
+            DEFAULT_EMBEDDING_REVISION,
+        )
+        commit = "a" * 40
+        self.assertEqual(
+            resolve_model_revision(
+                "example/alternative",
+                commit,
+                default_model=DEFAULT_EMBEDDING_MODEL,
+                default_revision=DEFAULT_EMBEDDING_REVISION,
+            ),
+            commit,
+        )
+        for revision in (None, "main", "abc123"):
+            with self.assertRaisesRegex(ValueError, "immutable 40-character"):
+                resolve_model_revision(
+                    "example/alternative",
+                    revision,
+                    default_model=DEFAULT_EMBEDDING_MODEL,
+                    default_revision=DEFAULT_EMBEDDING_REVISION,
+                )
+        with patch(
+            "graphify_embeddings.models._imports",
+            return_value=(FakeTorch, None, None),
+        ):
+            self.assertEqual(resolve_device("cuda"), "cuda:0")
+            self.assertEqual(resolve_device("cuda:1"), "cuda:1")
+            for invalid in ("cudafoo", "cuda:-1", "cuda:", "cuda:1x"):
+                with self.assertRaisesRegex(ValueError, "Unsupported device"):
+                    resolve_device(invalid)
 
     def test_reranker_template_compatibility_view_does_not_mutate_snapshot(self):
         model = self.root / "model"
@@ -414,6 +557,32 @@ class GraphifyEmbeddingTests(unittest.TestCase):
         self.assertEqual(len(semantic), count)
         self.assertEqual(semantic[0]["confidence"], "INFERRED")
         self.assertIn("confidence_score", semantic[0])
+
+    @unittest.skipUnless(shutil.which("graphify"), "Graphify CLI is not installed")
+    def test_enriched_directed_graph_round_trips_through_graphify_cli(self):
+        payload = json.loads(self.graph_path.read_text(encoding="utf-8"))
+        payload["directed"] = True
+        self.graph_path.write_text(json.dumps(payload), encoding="utf-8")
+        graph = GraphifyGraph(self.graph_path)
+        index = EmbeddingIndex(graph)
+        index.build(FakeEmbedder(), show_progress=False)
+        target, count = index.write_linked_graph([("cache-loader", "gpu-loader", 0.9)])
+        self.assertEqual(count, 2)
+        result = subprocess.run(
+            [
+                "graphify",
+                "explain",
+                "load_embedding_cache",
+                "--graph",
+                str(target),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("load_embedding_cache", result.stdout)
 
 
 if __name__ == "__main__":

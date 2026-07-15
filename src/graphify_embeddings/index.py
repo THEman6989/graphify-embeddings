@@ -17,7 +17,7 @@ import numpy as np
 from .graph import DOCUMENT_SCHEMA, GraphifyGraph
 
 
-CACHE_SCHEMA = 4
+CACHE_SCHEMA = 5
 
 
 class Embedder(Protocol):
@@ -182,6 +182,7 @@ class EmbeddingIndex:
                 "instruction": getattr(embedder, "instruction", None),
                 "revision": getattr(embedder, "revision", None),
                 "wrapper_sha256": getattr(embedder, "wrapper_sha256", None),
+                "artifact_fingerprint": getattr(embedder, "artifact_fingerprint", None),
                 "dtype": str(getattr(embedder, "dtype", "unknown")),
             }
         embedding_identity["document_schema"] = DOCUMENT_SCHEMA

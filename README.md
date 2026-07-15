@@ -114,7 +114,7 @@ graphify-out/cache/embeddings.json   model/revision/wrapper/prompt identity, dim
 graphify-out/cache/embeddings.npz    normalized float32 vectors, node IDs, matching generation ID
 ```
 
-Changing the instruction, dtype, backend, pinned model revision, local wrapper script, or document-construction schema invalidates the relevant cache identity. A writer lock serializes concurrent builds; a generation ID detects partial/crash-mixed metadata/vector writes. Non-finite, non-normalized, duplicate-ID, graph-membership, content-hash, row-count, and dimension mismatches are rejected. Only new or changed node texts are embedded on a compatible subsequent `index` run. Source context around `source_location` is included when the referenced source file exists.
+Changing the instruction, dtype, backend, pinned model revision, local model artifact, local wrapper script, or document-construction schema invalidates the relevant cache identity. Local VL wrapper scripts must match the audited official SHA-256; mutable custom Python is never executed. Alternative remote models require an explicit immutable 40-character commit revision. A writer lock serializes concurrent builds; a generation ID detects partial/crash-mixed metadata/vector writes. Non-finite, non-normalized, duplicate-ID, graph-membership, content-hash, row-count, and dimension mismatches are rejected. Only new or changed node texts are embedded on a compatible subsequent `index` run. Source context around `source_location` is included when the referenced source file exists.
 
 ## Models
 
@@ -126,9 +126,12 @@ Defaults:
 The text-only equivalents can be selected explicitly:
 
 ```bash
-graphify-embeddings index --embedding-model Qwen/Qwen3-Embedding-8B
+graphify-embeddings index \
+  --embedding-model Qwen/Qwen3-Embedding-8B \
+  --embedding-revision <40-character-commit>
 graphify-embeddings search "..." --rerank \
-  --reranker-model Qwen/Qwen3-Reranker-8B
+  --reranker-model Qwen/Qwen3-Reranker-8B \
+  --reranker-revision <40-character-commit>
 ```
 
 ## Why both Graphify and embeddings?

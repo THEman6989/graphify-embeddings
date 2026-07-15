@@ -18,6 +18,8 @@ from .models import (
     DEFAULT_RERANKER_MODEL,
     QwenEmbedder,
     QwenReranker,
+    local_model_fingerprint,
+    resolve_model_revision,
 )
 
 
@@ -55,14 +57,20 @@ def _expected_embedding_identity(args: argparse.Namespace) -> dict[str, str | No
     official = (
         args.embedding_model == DEFAULT_EMBEDDING_MODEL or wrapper_sha256 is not None
     )
+    revision = resolve_model_revision(
+        args.embedding_model,
+        args.embedding_revision,
+        default_model=DEFAULT_EMBEDDING_MODEL,
+        default_revision=DEFAULT_EMBEDDING_REVISION,
+    )
+    artifact_fingerprint = local_model_fingerprint(local) if local.is_dir() else None
     return {
         "model": args.embedding_model,
         "backend": "official_vl_wrapper" if official else "sentence_transformers",
         "instruction": args.instruction,
-        "revision": DEFAULT_EMBEDDING_REVISION
-        if args.embedding_model == DEFAULT_EMBEDDING_MODEL
-        else None,
+        "revision": revision,
         "wrapper_sha256": wrapper_sha256,
+        "artifact_fingerprint": artifact_fingerprint,
         "dtype": str(args.dtype).lower(),
         "document_schema": DOCUMENT_SCHEMA,
     }
@@ -78,6 +86,10 @@ def _add_graph_argument(parser: argparse.ArgumentParser) -> None:
 
 def _add_embedding_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
+    parser.add_argument(
+        "--embedding-revision",
+        help="Immutable 40-character commit for an alternative remote embedding model",
+    )
     parser.add_argument(
         "--device", default="auto", help="auto chooses cuda:0 when available"
     )
@@ -114,6 +126,10 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--neighbors", type=_nonnegative_int, default=1)
     search_parser.add_argument("--rerank", action="store_true")
     search_parser.add_argument("--reranker-model", default=DEFAULT_RERANKER_MODEL)
+    search_parser.add_argument(
+        "--reranker-revision",
+        help="Immutable 40-character commit for an alternative remote reranker",
+    )
     search_parser.add_argument("--reranker-batch-size", type=_positive_int, default=1)
     search_parser.add_argument("--json", action="store_true", dest="json_output")
     search_parser.add_argument("--force-index", action="store_true")
@@ -146,6 +162,7 @@ def _embedder_from_args(args: argparse.Namespace) -> QwenEmbedder:
         batch_size=args.batch_size,
         instruction=args.instruction,
         local_files_only=args.local_files_only,
+        revision=args.embedding_revision,
     )
 
 
@@ -237,6 +254,7 @@ def command_search(args: argparse.Namespace) -> int:
                 dtype=args.dtype,
                 instruction=args.instruction,
                 local_files_only=args.local_files_only,
+                revision=args.reranker_revision,
             )
         results = index.search(
             args.query,
