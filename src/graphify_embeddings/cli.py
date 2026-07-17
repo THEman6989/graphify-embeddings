@@ -138,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_embedding_arguments(index_parser)
     index_parser.add_argument("--force", action="store_true")
     index_parser.add_argument("--no-source-context", action="store_true")
+    index_parser.add_argument(
+        "--checkpoint-size",
+        type=_positive_int,
+        default=64,
+        help="Persist resumable embedding shards after this many nodes (default: 64)",
+    )
 
     search_parser = subparsers.add_parser(
         "search", help="Semantic/hybrid search over a Graphify graph"
@@ -310,6 +316,7 @@ def _ensure_index(
                 force=bool(
                     getattr(args, "force_index", False) or getattr(args, "force", False)
                 ),
+                checkpoint_size=getattr(args, "checkpoint_size", 64),
             )
         except Exception:
             if embedder is not None:
@@ -335,6 +342,7 @@ def _index_stats(args: argparse.Namespace) -> dict[str, Any]:
                 "graph": str(Path(args.graph).expanduser().resolve()),
                 "force": args.force,
                 "include_source": not args.no_source_context,
+                "checkpoint_size": args.checkpoint_size,
             },
         )
     graph = GraphifyGraph(args.graph)
@@ -344,6 +352,7 @@ def _index_stats(args: argparse.Namespace) -> dict[str, Any]:
             embedder,
             include_source=not args.no_source_context,
             force=args.force,
+            checkpoint_size=args.checkpoint_size,
         )
 
 

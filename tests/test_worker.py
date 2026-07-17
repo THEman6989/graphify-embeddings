@@ -1260,6 +1260,39 @@ class ServiceManager:
 
 
 class ModelServiceTests(unittest.TestCase):
+    def test_index_rejects_non_positive_integer_checkpoint_size(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            graph_dir = Path(temporary) / "graphify-out"
+            graph_dir.mkdir()
+            graph_path = graph_dir / "graph.json"
+            graph_path.write_text(
+                json.dumps(
+                    {
+                        "directed": False,
+                        "multigraph": False,
+                        "graph": {},
+                        "nodes": [{"id": "a", "label": "cache", "docstring": "cache"}],
+                        "links": [],
+                        "hyperedges": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = ModelService(ServiceManager())
+            embedder = service.manager.embedding
+
+            for invalid in (True, "64", 1.5, 0, -1):
+                with self.subTest(invalid=invalid):
+                    with self.assertRaisesRegex(
+                        ValueError, "checkpoint_size must be a positive integer"
+                    ):
+                        service.index(
+                            {"graph": str(graph_path), "checkpoint_size": invalid}
+                        )
+
+            self.assertFalse((graph_dir / "cache").exists())
+            self.assertFalse(embedder.closed)
+
     def test_second_search_reuses_resident_index(self):
         from unittest.mock import patch
 

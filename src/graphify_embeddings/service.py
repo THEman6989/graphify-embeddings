@@ -218,6 +218,7 @@ class ModelService:
         )
 
     def index(self, payload: dict[str, Any]) -> dict[str, Any]:
+        checkpoint_size = _positive_int(payload, "checkpoint_size", 64)
         graph = self._graph(payload)
         self._unload_index()
         include_source = bool(payload.get("include_source", True))
@@ -228,6 +229,7 @@ class ModelService:
             include_source=include_source,
             force=force,
             show_progress=False,
+            checkpoint_size=checkpoint_size,
         )
 
     def search(self, payload: dict[str, Any]) -> dict[str, Any]:

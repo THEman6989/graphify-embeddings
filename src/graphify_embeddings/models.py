@@ -146,6 +146,22 @@ def _empty_device_cache(torch, device: str) -> None:
         torch.cuda.empty_cache()
 
 
+def _is_cuda_oom(error: BaseException, torch, device: str) -> bool:
+    if not str(device).startswith("cuda"):
+        return False
+    oom_type = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+    if isinstance(oom_type, type) and isinstance(error, oom_type):
+        return True
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "cuda out of memory",
+            "cuda error: out of memory",
+        )
+    )
+
+
 class QwenEmbedder:
     def __init__(
         self,
@@ -303,15 +319,53 @@ class QwenEmbedder:
         if self.backend == "official_vl_wrapper":
             batches = []
             text_list = list(texts)
-            for start in range(0, len(text_list), self.batch_size):
-                chunk = text_list[start : start + self.batch_size]
-                embeddings = self.model.process(
-                    [{"text": text, "instruction": self.instruction} for text in chunk],
-                    normalize=True,
-                )
+            start = 0
+            effective_batch_size = self.batch_size
+            while start < len(text_list):
+                chunk = text_list[start : start + effective_batch_size]
+                embeddings = None
+                oom_retry = False
+                single_document_oom = False
+                try:
+                    embeddings = self.model.process(
+                        [
+                            {"text": text, "instruction": self.instruction}
+                            for text in chunk
+                        ],
+                        normalize=True,
+                    )
+                except RuntimeError as error:
+                    if not _is_cuda_oom(error, self.torch, self.device):
+                        raise
+                    oom_retry = True
+                    single_document_oom = effective_batch_size <= 1
+                if oom_retry:
+                    # Cleanup runs after leaving the except block so Python no longer
+                    # retains the failed model call's traceback and GPU tensors.
+                    del chunk
+                    gc.collect()
+                    _empty_device_cache(self.torch, self.device)
+                    if single_document_oom:
+                        raise RuntimeError(
+                            "CUDA OOM while embedding a single document; reduce the "
+                            "document/source-context size or use a GPU with more VRAM"
+                        ) from None
+                    reduced_batch_size = max(1, effective_batch_size // 2)
+                    print(
+                        "CUDA OOM: reducing embedding batch size "
+                        f"{effective_batch_size} -> {reduced_batch_size} and retrying",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    effective_batch_size = reduced_batch_size
+                    self.batch_size = reduced_batch_size
+                    continue
+                if embeddings is None:
+                    raise RuntimeError("Embedding backend returned no vectors")
                 if hasattr(embeddings, "detach"):
                     embeddings = embeddings.detach().float().cpu().numpy()
                 batches.append(np.asarray(embeddings, dtype=np.float32))
+                start += len(chunk)
             vectors = np.concatenate(batches, axis=0)
         else:
             vectors = self.model.encode(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import numpy as np
@@ -77,6 +79,17 @@ class SlowFakeEmbedder(FakeEmbedder):
         return super().encode(texts, show_progress=show_progress)
 
 
+class BatchedFakeEmbedder(FakeEmbedder):
+    batch_size = 2
+
+
+class FailAfterFirstBatchEmbedder(BatchedFakeEmbedder):
+    def encode(self, texts, *, show_progress=False):
+        if self.calls:
+            raise RuntimeError("simulated interruption")
+        return super().encode(texts, show_progress=show_progress)
+
+
 class ClosingEmbedder(FakeEmbedder):
     def __init__(self):
         super().__init__()
@@ -119,6 +132,47 @@ class FakeTorch:
         @staticmethod
         def empty_cache():
             return None
+
+
+class OOMAboveTwoModel:
+    def __init__(self):
+        self.batch_sizes: list[int] = []
+
+    def process(self, items, normalize=True):
+        self.batch_sizes.append(len(items))
+        if len(items) > 2:
+            raise RuntimeError("CUDA out of memory")
+        return np.asarray(
+            [[float(index + 1), 1.0, 0.5, 0.25] for index, _ in enumerate(items)],
+            dtype=np.float32,
+        )
+
+
+class OOMAboveOneOrderedModel:
+    def __init__(self):
+        self.batch_sizes: list[int] = []
+
+    def process(self, items, normalize=True):
+        self.batch_sizes.append(len(items))
+        if len(items) > 1:
+            raise RuntimeError("CUDA out of memory")
+        value = float(items[0]["text"])
+        return np.asarray([[value, 1.0, 0.5, 0.25]], dtype=np.float32)
+
+
+class AlwaysOOMModel:
+    def process(self, items, normalize=True):
+        raise RuntimeError("CUDA out of memory")
+
+
+class NonOOMFailureModel:
+    def process(self, items, normalize=True):
+        raise RuntimeError("broken model contract")
+
+
+class GenericAllocationOOMModel:
+    def process(self, items, normalize=True):
+        raise RuntimeError("memory allocation failed with oom")
 
 
 class GraphifyEmbeddingTests(unittest.TestCase):
@@ -180,6 +234,21 @@ class GraphifyEmbeddingTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    @staticmethod
+    def _official_embedder_for_test(model, *, batch_size=4):
+        embedder = object.__new__(QwenEmbedder)
+        embedder.backend = "official_vl_wrapper"
+        embedder.model = model
+        embedder.instruction = "test"
+        embedder.batch_size = batch_size
+        embedder.__dict__["torch"] = FakeTorch
+        embedder.device = "cuda:1"
+        return embedder
+
+    def test_index_parser_accepts_checkpoint_size(self):
+        args = cli.build_parser().parse_args(["index", "--checkpoint-size", "128"])
+        self.assertEqual(args.checkpoint_size, 128)
+
     def test_node_text_includes_source_context_without_path_escape(self):
         graph = GraphifyGraph(self.graph_path)
         text = graph.node_text(graph.by_id["cache-loader"])
@@ -211,6 +280,305 @@ class GraphifyEmbeddingTests(unittest.TestCase):
         third = changed_index.build(third_embedder, show_progress=False)
         self.assertEqual(third["embedded"], 1)
         self.assertEqual(third["reused"], 2)
+
+    def test_incremental_cache_reuses_vectors_when_node_set_changes(self):
+        graph = GraphifyGraph(self.graph_path)
+        EmbeddingIndex(graph).build(FakeEmbedder(), show_progress=False)
+
+        updated = json.loads(self.graph_path.read_text(encoding="utf-8"))
+        updated["nodes"] = updated["nodes"][:2]
+        updated["nodes"].append(
+            {
+                "id": "new-node",
+                "label": "new_node",
+                "docstring": "A newly added node",
+                "source_file": "new.py",
+                "source_location": "L1",
+                "community": 2,
+            }
+        )
+        updated["links"] = []
+        self.graph_path.write_text(json.dumps(updated), encoding="utf-8")
+
+        embedder = FakeEmbedder()
+        stats = EmbeddingIndex(GraphifyGraph(self.graph_path)).build(
+            embedder, show_progress=False
+        )
+
+        self.assertEqual(stats["embedded"], 1)
+        self.assertEqual(stats["reused"], 2)
+        self.assertEqual(len(embedder.calls), 1)
+        self.assertEqual(len(embedder.calls[0]), 1)
+
+    def test_build_reports_progress_after_each_embedding_batch(self):
+        graph = GraphifyGraph(self.graph_path)
+        index = EmbeddingIndex(graph)
+        stderr = io.StringIO()
+
+        with patch("sys.stderr", stderr):
+            index.build(BatchedFakeEmbedder(), show_progress=True)
+
+        output = stderr.getvalue()
+        self.assertIn("Embedding progress: 2/3 (66.7%)", output)
+        self.assertIn("Embedding progress: 3/3 (100.0%)", output)
+        self.assertIn("ETA", output)
+
+    def test_qwen_embedder_retries_cuda_oom_with_smaller_batches(self):
+        embedder = self._official_embedder_for_test(OOMAboveTwoModel())
+        stderr = io.StringIO()
+
+        with (
+            patch("graphify_embeddings.models._empty_device_cache") as empty_cache,
+            patch("sys.stderr", stderr),
+        ):
+            vectors = embedder.encode(["a", "b", "c", "d"])
+
+        self.assertEqual(vectors.shape, (4, 4))
+        self.assertEqual(embedder.model.batch_sizes, [4, 2, 2])
+        self.assertEqual(embedder.batch_size, 2)
+        empty_cache.assert_called_once_with(FakeTorch, "cuda:1")
+        self.assertIn("CUDA OOM", stderr.getvalue())
+        self.assertIn("batch size 4 -> 2", stderr.getvalue())
+
+    def test_qwen_embedder_reduces_oom_to_one_and_preserves_order(self):
+        model = OOMAboveOneOrderedModel()
+        embedder = self._official_embedder_for_test(model)
+
+        with (
+            patch("graphify_embeddings.models._empty_device_cache"),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            vectors = embedder.encode(["1", "2", "3"])
+
+        expected = np.asarray(
+            [[1.0, 1.0, 0.5, 0.25], [2.0, 1.0, 0.5, 0.25], [3.0, 1.0, 0.5, 0.25]],
+            dtype=np.float32,
+        )
+        expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+        np.testing.assert_allclose(vectors, expected)
+        self.assertEqual(model.batch_sizes, [3, 2, 1, 1, 1])
+        self.assertEqual(embedder.batch_size, 1)
+
+    def test_qwen_embedder_reports_single_document_oom(self):
+        embedder = self._official_embedder_for_test(AlwaysOOMModel(), batch_size=1)
+
+        with (
+            patch("graphify_embeddings.models._empty_device_cache") as empty_cache,
+            self.assertRaisesRegex(RuntimeError, "single document"),
+        ):
+            embedder.encode(["1"])
+
+        empty_cache.assert_called_once_with(FakeTorch, "cuda:1")
+
+    def test_qwen_embedder_does_not_swallow_non_oom_runtime_error(self):
+        embedder = self._official_embedder_for_test(NonOOMFailureModel())
+
+        with (
+            patch("graphify_embeddings.models._empty_device_cache") as empty_cache,
+            self.assertRaisesRegex(RuntimeError, "broken model contract"),
+        ):
+            embedder.encode(["1"])
+
+        empty_cache.assert_not_called()
+
+    def test_qwen_embedder_does_not_misclassify_generic_allocation_oom(self):
+        embedder = self._official_embedder_for_test(GenericAllocationOOMModel())
+
+        with (
+            patch("graphify_embeddings.models._empty_device_cache") as empty_cache,
+            self.assertRaisesRegex(RuntimeError, "memory allocation failed with oom"),
+        ):
+            embedder.encode(["1"])
+
+        empty_cache.assert_not_called()
+
+    def test_qwen_embedder_releases_active_exception_before_oom_cleanup(self):
+        embedder = self._official_embedder_for_test(OOMAboveTwoModel())
+        cleanup_exception_states = []
+
+        def record_exception_state(_torch, _device):
+            cleanup_exception_states.append(sys.exc_info())
+
+        with (
+            patch(
+                "graphify_embeddings.models._empty_device_cache",
+                side_effect=record_exception_state,
+            ),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            embedder.encode(["a", "b", "c", "d"])
+
+        self.assertEqual(len(cleanup_exception_states), 1)
+        self.assertEqual(cleanup_exception_states[0], (None, None, None))
+
+    def test_build_rejects_invalid_checkpoint_size_without_writing_cache(self):
+        graph = GraphifyGraph(self.graph_path)
+
+        for invalid in (True, "64", 1.5, 0, -1):
+            with self.subTest(invalid=invalid):
+                index = EmbeddingIndex(graph)
+                with self.assertRaisesRegex(
+                    ValueError, "checkpoint_size must be a positive integer"
+                ):
+                    index.build(
+                        BatchedFakeEmbedder(),
+                        show_progress=False,
+                        checkpoint_size=cast(Any, invalid),
+                    )
+                self.assertFalse(index.cache_dir.exists())
+
+    def test_build_resumes_from_persistent_checkpoint_shards(self):
+        graph = GraphifyGraph(self.graph_path)
+        interrupted = EmbeddingIndex(graph)
+
+        with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+            interrupted.build(
+                FailAfterFirstBatchEmbedder(),
+                show_progress=False,
+                checkpoint_size=2,
+            )
+
+        self.assertTrue(interrupted.checkpoint_manifest_path.is_file())
+        self.assertEqual(len(list(interrupted.checkpoint_dir.glob("shard-*.npz"))), 1)
+
+        resumed = EmbeddingIndex(graph)
+        embedder = BatchedFakeEmbedder()
+        stats = resumed.build(
+            embedder,
+            show_progress=False,
+            checkpoint_size=2,
+        )
+
+        self.assertEqual(stats["embedded"], 3)
+        self.assertEqual(stats["computed"], 1)
+        self.assertEqual(stats["resumed"], 2)
+        self.assertEqual(len(embedder.calls), 1)
+        self.assertEqual(len(embedder.calls[0]), 1)
+        self.assertFalse(resumed.checkpoint_dir.exists())
+
+    def test_fully_resumed_build_reports_completion_progress(self):
+        graph = GraphifyGraph(self.graph_path)
+        interrupted = EmbeddingIndex(graph)
+
+        with (
+            patch.object(
+                EmbeddingIndex,
+                "_write_vectors_atomic",
+                side_effect=RuntimeError("simulated final publication interruption"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "final publication interruption"),
+        ):
+            interrupted.build(
+                BatchedFakeEmbedder(),
+                show_progress=False,
+                checkpoint_size=2,
+            )
+
+        stderr = io.StringIO()
+        resumed = EmbeddingIndex(graph)
+        with patch("sys.stderr", stderr):
+            stats = resumed.build(
+                BatchedFakeEmbedder(),
+                show_progress=True,
+                checkpoint_size=2,
+            )
+
+        self.assertEqual(stats["computed"], 0)
+        self.assertEqual(stats["resumed"], 3)
+        output = stderr.getvalue()
+        self.assertEqual(output.count("Embedding progress:"), 1)
+        self.assertIn("Embedding progress: 3/3 (100.0%)", output)
+        self.assertFalse(resumed.checkpoint_dir.exists())
+
+    def test_force_build_discards_compatible_checkpoint_shards(self):
+        graph = GraphifyGraph(self.graph_path)
+        interrupted = EmbeddingIndex(graph)
+
+        with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+            interrupted.build(
+                FailAfterFirstBatchEmbedder(),
+                show_progress=False,
+                checkpoint_size=2,
+            )
+
+        forced = EmbeddingIndex(graph)
+        embedder = BatchedFakeEmbedder()
+        stats = forced.build(
+            embedder,
+            force=True,
+            show_progress=False,
+            checkpoint_size=2,
+        )
+
+        self.assertEqual(stats["embedded"], 3)
+        self.assertEqual(stats["computed"], 3)
+        self.assertEqual(stats["resumed"], 0)
+        self.assertEqual([len(call) for call in embedder.calls], [2, 1])
+        self.assertFalse(forced.checkpoint_dir.exists())
+
+    def test_build_discards_non_normalized_checkpoint_shard(self):
+        graph = GraphifyGraph(self.graph_path)
+        interrupted = EmbeddingIndex(graph)
+
+        with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+            interrupted.build(
+                FailAfterFirstBatchEmbedder(),
+                show_progress=False,
+                checkpoint_size=2,
+            )
+
+        shard_path = next(interrupted.checkpoint_dir.glob("shard-*.npz"))
+        with np.load(shard_path, allow_pickle=False) as data:
+            node_ids = data["node_ids"].copy()
+            content_hashes = data["content_hashes"].copy()
+            vectors = data["vectors"].copy()
+            generation_id = data["generation_id"].copy()
+        np.savez_compressed(
+            shard_path,
+            node_ids=node_ids,
+            content_hashes=content_hashes,
+            vectors=vectors * 2.0,
+            generation_id=generation_id,
+        )
+
+        resumed = EmbeddingIndex(graph)
+        embedder = BatchedFakeEmbedder()
+        stats = resumed.build(
+            embedder,
+            show_progress=False,
+            checkpoint_size=2,
+        )
+
+        self.assertEqual(stats["computed"], 3)
+        self.assertEqual(stats["resumed"], 0)
+        self.assertEqual([len(call) for call in embedder.calls], [2, 1])
+        self.assertFalse(resumed.checkpoint_dir.exists())
+
+    def test_build_discards_truncated_checkpoint_shard(self):
+        graph = GraphifyGraph(self.graph_path)
+        interrupted = EmbeddingIndex(graph)
+
+        with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+            interrupted.build(
+                FailAfterFirstBatchEmbedder(),
+                show_progress=False,
+                checkpoint_size=2,
+            )
+
+        shard_path = next(interrupted.checkpoint_dir.glob("shard-*.npz"))
+        shard_path.write_bytes(b"truncated-npz")
+
+        resumed = EmbeddingIndex(graph)
+        embedder = BatchedFakeEmbedder()
+        stats = resumed.build(
+            embedder,
+            show_progress=False,
+            checkpoint_size=2,
+        )
+
+        self.assertEqual(stats["computed"], 3)
+        self.assertEqual(stats["resumed"], 0)
+        self.assertFalse(resumed.checkpoint_dir.exists())
 
     def test_semantic_search_and_graph_neighbors(self):
         graph = GraphifyGraph(self.graph_path)

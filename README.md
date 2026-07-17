@@ -60,9 +60,13 @@ Manual operation remains available:
 
 ```bash
 graphify extract /path/to/repository --code-only
-graphify-embeddings index --graph /path/to/repository/graphify-out/graph.json
+graphify-embeddings index \
+  --graph /path/to/repository/graphify-out/graph.json \
+  --batch-size 2 --checkpoint-size 64
 graphify-embeddings link --graph /path/to/repository/graphify-out/graph.json
 ```
+
+Indexing reports completed nodes, percentage, rate, and ETA after each embedding batch. On CUDA OOM, the official Qwen wrapper clears the CUDA allocator cache, halves the active batch size down to one, and retries the same work. Completed vectors are persisted in atomic checkpoint shards (64 nodes by default), so an interrupted compatible run resumes instead of restarting. `--batch-size` controls simultaneous GPU work; `--checkpoint-size` independently controls how often resumable CPU-side shards are published.
 
 ## Search and reranking
 
@@ -167,12 +171,15 @@ CLI `--rerank` and `--no-rerank` override the configured reranker default for on
 graphify-out/cache/embeddings.json  identity, hashes, dimensions, generation
 graphify-out/cache/embeddings.npz   normalized float32 vectors and node IDs
 graphify-out/cache/.embeddings.lock serialized writer lock
+graphify-out/cache/embedding-checkpoint/ temporary resumable shard generation
 graphify-out/graph.semantic.json     optional semantic Graphify graph
 ```
 
 The cache is JSON+NPZ rather than SQLite because retrieval uses one contiguous dense matrix. Cache schema 6 includes model/revision, exact wrapper SHA-256, local artifact fingerprint, instruction, dtype, attention backend and document schema. Any mismatch invalidates reuse.
 
 Publication is atomic and generation-paired. Non-finite or non-normalized vectors, duplicate IDs, graph-membership mismatch, dimensions, incomplete hashes and mixed generations fail closed.
+
+Incremental reuse is keyed by node ID plus content hash and remains valid when nodes are added or removed. Checkpoint shards additionally bind every row to the complete embedding identity and current content hash. They are deleted only after the final cache generation has been published successfully.
 
 ## Model trust boundary
 

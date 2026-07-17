@@ -5,7 +5,9 @@ import json
 import math
 import os
 import shutil
+import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +20,13 @@ from .graph import DOCUMENT_SCHEMA, GraphifyGraph
 
 
 CACHE_SCHEMA = 6
+CHECKPOINT_SCHEMA = 1
+
+
+def _validate_checkpoint_size(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("checkpoint_size must be a positive integer")
+    return value
 
 
 class Embedder(Protocol):
@@ -44,6 +53,8 @@ class EmbeddingIndex:
         self.cache_dir = graph.path.parent / "cache"
         self.metadata_path = self.cache_dir / "embeddings.json"
         self.vectors_path = self.cache_dir / "embeddings.npz"
+        self.checkpoint_dir = self.cache_dir / "embedding-checkpoint"
+        self.checkpoint_manifest_path = self.checkpoint_dir / "manifest.json"
         self.metadata: dict[str, Any] = {}
         self.node_ids: list[str] = []
         self.vectors = np.empty((0, 0), dtype=np.float32)
@@ -51,7 +62,7 @@ class EmbeddingIndex:
     def exists(self) -> bool:
         return self.metadata_path.is_file() and self.vectors_path.is_file()
 
-    def load(self) -> "EmbeddingIndex":
+    def load(self, *, require_current_graph: bool = True) -> "EmbeddingIndex":
         if not self.exists():
             raise FileNotFoundError(
                 f"Embedding index missing beside {self.graph.path}; run the index command first"
@@ -69,7 +80,7 @@ class EmbeddingIndex:
             raise ValueError("Embedding cache is inconsistent")
         if len(set(self.node_ids)) != len(self.node_ids):
             raise ValueError("Embedding cache contains duplicate node IDs")
-        if set(self.node_ids) != set(self.graph.by_id):
+        if require_current_graph and set(self.node_ids) != set(self.graph.by_id):
             raise ValueError("Embedding cache node IDs do not match the current graph")
         content_hashes = self.metadata.get("content_hashes")
         if not isinstance(content_hashes, dict) or set(content_hashes) != set(
@@ -133,6 +144,135 @@ class EmbeddingIndex:
             Path(temporary).unlink(missing_ok=True)
             raise
 
+    @staticmethod
+    def _write_checkpoint_shard_atomic(
+        path: Path,
+        node_ids: list[str],
+        content_hashes: list[str],
+        vectors: np.ndarray,
+        generation_id: str,
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=path.name + ".", suffix=".npz", dir=path.parent
+        )
+        os.close(fd)
+        try:
+            np.savez_compressed(
+                temporary,
+                node_ids=np.asarray(node_ids, dtype=np.str_),
+                content_hashes=np.asarray(content_hashes, dtype=np.str_),
+                vectors=np.asarray(vectors, dtype=np.float32),
+                generation_id=np.asarray(generation_id, dtype=np.str_),
+            )
+            os.replace(temporary, path)
+        except Exception:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+
+    def _new_checkpoint_manifest(
+        self, embedding_identity: dict[str, Any], include_source: bool
+    ) -> dict[str, Any]:
+        if self.checkpoint_dir.exists():
+            shutil.rmtree(self.checkpoint_dir)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema_version": CHECKPOINT_SCHEMA,
+            "generation_id": uuid4().hex,
+            "embedding_identity": embedding_identity,
+            "include_source": include_source,
+            "shards": [],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._write_json_atomic(self.checkpoint_manifest_path, manifest)
+        return manifest
+
+    def _load_checkpoint(
+        self,
+        embedding_identity: dict[str, Any],
+        include_source: bool,
+        current_hashes: dict[str, str],
+    ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+        try:
+            manifest = json.loads(
+                self.checkpoint_manifest_path.read_text(encoding="utf-8")
+            )
+            if (
+                manifest.get("schema_version") != CHECKPOINT_SCHEMA
+                or manifest.get("embedding_identity") != embedding_identity
+                or manifest.get("include_source") != include_source
+                or not isinstance(manifest.get("shards"), list)
+            ):
+                raise ValueError("Embedding checkpoint is incompatible")
+            generation_id = str(manifest["generation_id"])
+            resumed: dict[str, np.ndarray] = {}
+            checkpoint_dimension: int | None = None
+            for shard_name in manifest["shards"]:
+                if (
+                    not isinstance(shard_name, str)
+                    or Path(shard_name).name != shard_name
+                    or not shard_name.startswith("shard-")
+                    or not shard_name.endswith(".npz")
+                ):
+                    raise ValueError("Embedding checkpoint shard name is invalid")
+                shard_path = self.checkpoint_dir / shard_name
+                with np.load(shard_path, allow_pickle=False) as data:
+                    node_ids = [str(value) for value in data["node_ids"].tolist()]
+                    shard_hashes = [
+                        str(value) for value in data["content_hashes"].tolist()
+                    ]
+                    vectors = np.asarray(data["vectors"], dtype=np.float32)
+                    shard_generation = str(data["generation_id"].item())
+                if (
+                    shard_generation != generation_id
+                    or len(node_ids) != len(shard_hashes)
+                    or vectors.ndim != 2
+                    or vectors.shape[0] != len(node_ids)
+                    or not np.isfinite(vectors).all()
+                ):
+                    raise ValueError("Embedding checkpoint shard is inconsistent")
+                if len(vectors):
+                    norms = np.linalg.norm(vectors, axis=1)
+                    if not np.allclose(norms, 1.0, rtol=1e-3, atol=1e-3):
+                        raise ValueError("Embedding checkpoint shard is not normalized")
+                    if checkpoint_dimension is None:
+                        checkpoint_dimension = int(vectors.shape[1])
+                    elif vectors.shape[1] != checkpoint_dimension:
+                        raise ValueError(
+                            "Embedding checkpoint shards have inconsistent dimensions"
+                        )
+                for index, node_id in enumerate(node_ids):
+                    if node_id in resumed:
+                        raise ValueError(
+                            "Embedding checkpoint contains duplicate node IDs"
+                        )
+                    if current_hashes.get(node_id) == shard_hashes[index]:
+                        resumed[node_id] = vectors[index]
+            return manifest, resumed
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            return self._new_checkpoint_manifest(embedding_identity, include_source), {}
+
+    def _append_checkpoint_shard(
+        self,
+        manifest: dict[str, Any],
+        node_ids: list[str],
+        hashes: dict[str, str],
+        vectors: list[np.ndarray],
+    ) -> None:
+        if not node_ids:
+            return
+        shard_name = f"shard-{len(manifest['shards']):06d}.npz"
+        self._write_checkpoint_shard_atomic(
+            self.checkpoint_dir / shard_name,
+            node_ids,
+            [hashes[node_id] for node_id in node_ids],
+            np.stack(vectors).astype(np.float32),
+            str(manifest["generation_id"]),
+        )
+        manifest["shards"].append(shard_name)
+        manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_json_atomic(self.checkpoint_manifest_path, manifest)
+
     @contextmanager
     def _write_lock(self):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -151,13 +291,16 @@ class EmbeddingIndex:
         include_source: bool = True,
         force: bool = False,
         show_progress: bool = True,
+        checkpoint_size: int = 64,
     ) -> dict[str, Any]:
+        checkpoint_size = _validate_checkpoint_size(checkpoint_size)
         with self._write_lock():
             return self._build_locked(
                 embedder,
                 include_source=include_source,
                 force=force,
                 show_progress=show_progress,
+                checkpoint_size=checkpoint_size,
             )
 
     def _build_locked(
@@ -167,14 +310,22 @@ class EmbeddingIndex:
         include_source: bool = True,
         force: bool = False,
         show_progress: bool = True,
+        checkpoint_size: int = 64,
     ) -> dict[str, Any]:
+        checkpoint_size = _validate_checkpoint_size(checkpoint_size)
         documents = self.graph.documents(include_source=include_source)
         node_ids = [node_id for node_id, _ in documents]
         text_by_id = dict(documents)
         hashes = self.graph.content_hashes(include_source=include_source)
         identity_factory = getattr(embedder, "cache_identity", None)
+        embedding_identity: dict[str, Any]
         if callable(identity_factory):
-            embedding_identity = dict(identity_factory())
+            raw_identity = identity_factory()
+            if not isinstance(raw_identity, dict):
+                raise TypeError("Embedding cache identity must be a mapping")
+            embedding_identity = {
+                str(key): value for key, value in raw_identity.items()
+            }
         else:
             embedding_identity = {
                 "model": embedder.model_name,
@@ -191,7 +342,7 @@ class EmbeddingIndex:
         old_hashes: dict[str, str] = {}
         if self.exists() and not force:
             try:
-                self.load()
+                self.load(require_current_graph=False)
                 if (
                     self.metadata.get("embedding_identity") == embedding_identity
                     and self.metadata.get("include_source") == include_source
@@ -215,10 +366,97 @@ class EmbeddingIndex:
             for node_id in node_ids
             if old_hashes.get(node_id) != hashes[node_id] or node_id not in old_vectors
         ]
-        new_vectors = embedder.encode(
-            [text_by_id[node_id] for node_id in changed],
-            show_progress=show_progress,
-        )
+        checkpoint_manifest: dict[str, Any] | None = None
+        resumed_vectors: dict[str, np.ndarray] = {}
+        if changed:
+            if force:
+                checkpoint_manifest = self._new_checkpoint_manifest(
+                    embedding_identity, include_source
+                )
+                checkpoint_vectors: dict[str, np.ndarray] = {}
+            else:
+                checkpoint_manifest, checkpoint_vectors = self._load_checkpoint(
+                    embedding_identity, include_source, hashes
+                )
+            resumed_vectors = {
+                node_id: vector
+                for node_id, vector in checkpoint_vectors.items()
+                if node_id in changed
+            }
+        remaining = [node_id for node_id in changed if node_id not in resumed_vectors]
+        computed_vectors: dict[str, np.ndarray] = {}
+        if not changed:
+            new_vectors = embedder.encode([], show_progress=False)
+        else:
+            batch_size = max(
+                1, int(getattr(embedder, "batch_size", len(remaining) or 1))
+            )
+            pending_ids: list[str] = []
+            pending_vectors: list[np.ndarray] = []
+            started_at = time.monotonic()
+            if show_progress and not remaining:
+                print(
+                    f"Embedding progress: {len(changed)}/{len(changed)} "
+                    "(100.0%) | 0.00 nodes/s | ETA 0.0s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            for start in range(0, len(remaining), batch_size):
+                batch_ids = remaining[start : start + batch_size]
+                batch_vectors = embedder.encode(
+                    [text_by_id[node_id] for node_id in batch_ids],
+                    show_progress=False,
+                )
+                batch_vectors = np.asarray(batch_vectors, dtype=np.float32)
+                if (
+                    batch_vectors.ndim != 2
+                    or batch_vectors.shape[0] != len(batch_ids)
+                    or not np.isfinite(batch_vectors).all()
+                ):
+                    raise RuntimeError(
+                        "Embedding backend returned invalid checkpoint batch vectors"
+                    )
+                for index, node_id in enumerate(batch_ids):
+                    vector = batch_vectors[index]
+                    computed_vectors[node_id] = vector
+                    pending_ids.append(node_id)
+                    pending_vectors.append(vector)
+                if len(pending_ids) >= checkpoint_size or start + len(batch_ids) >= len(
+                    remaining
+                ):
+                    if checkpoint_manifest is None:
+                        raise RuntimeError("Embedding checkpoint manifest is missing")
+                    self._append_checkpoint_shard(
+                        checkpoint_manifest,
+                        pending_ids,
+                        hashes,
+                        pending_vectors,
+                    )
+                    pending_ids = []
+                    pending_vectors = []
+                if show_progress:
+                    completed = len(resumed_vectors) + min(
+                        start + len(batch_ids), len(remaining)
+                    )
+                    elapsed = max(time.monotonic() - started_at, 1e-9)
+                    newly_completed = completed - len(resumed_vectors)
+                    rate = newly_completed / elapsed
+                    eta = (len(changed) - completed) / max(rate, 1e-9)
+                    percent = 100.0 * completed / len(changed)
+                    print(
+                        f"Embedding progress: {completed}/{len(changed)} "
+                        f"({percent:.1f}%) | {rate:.2f} nodes/s | ETA {eta:.1f}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            new_vectors = np.stack(
+                [
+                    resumed_vectors[node_id]
+                    if node_id in resumed_vectors
+                    else computed_vectors[node_id]
+                    for node_id in changed
+                ]
+            ).astype(np.float32)
         if changed and (new_vectors.ndim != 2 or new_vectors.shape[0] != len(changed)):
             raise RuntimeError(
                 "Embedding backend returned the wrong number or shape of vectors"
@@ -269,9 +507,13 @@ class EmbeddingIndex:
         self.metadata = metadata
         self.node_ids = node_ids
         self.vectors = vectors
+        if self.checkpoint_dir.exists():
+            shutil.rmtree(self.checkpoint_dir)
         return {
             "nodes": len(node_ids),
             "embedded": len(changed),
+            "computed": len(remaining),
+            "resumed": len(resumed_vectors),
             "reused": len(node_ids) - len(changed),
             "dimension": metadata["dimension"],
             "model": embedder.model_name,
